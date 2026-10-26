@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="190" viewBox="0 0 720 190" role="img" aria-labelledby="title desc">
+  <title id="title">mtdd</title>
+  <desc id="desc">MTProto proxy for Telegram</desc>
+  <defs>
+    <linearGradient id="background" x1="0" x2="1" y1="0" y2="1">
+      <stop stop-color="#0b1426"/>
+      <stop offset="1" stop-color="#102b40"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" x2="1">
+      <stop stop-color="#42c7f4"/>
+      <stop offset="1" stop-color="#69f2cf"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="718" height="188" rx="25" fill="url(#background)" stroke="#28465b" stroke-width="2"/>
+  <circle cx="92" cy="95" r="46" fill="#11394d" stroke="url(#accent)" stroke-width="3"/>
+  <path d="M83 77h-5l-6 2-3 4v8l3 4 6 2h5V77ZM101 77h5l6 2 3 4v8l-3 4-6 2h-5V77ZM79 111h26" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="square" stroke-linejoin="bevel"/>
+  <text x="161" y="101" fill="#f2f8ff" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="74" font-weight="750" letter-spacing="-4">mtdd</text>
+  <text x="166" y="134" fill="#a5c5d6" font-family="system-ui,-apple-system,Segoe UI,sans-serif" font-size="17" letter-spacing="3">MTPROTO PROXY FOR TELEGRAM</text>
+</svg>

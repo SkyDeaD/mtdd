@@ -1,0 +1,35 @@
+name: checks
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        sanitizer: ["OFF", "ON"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends g++ cmake ninja-build pkg-config libssl-dev libcurl4-openssl-dev libevent-dev nlohmann-json3-dev libgtest-dev
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMTDD_SANITIZE=${{ matrix.sanitizer }}
+      - name: Build
+        run: cmake --build build -j4
+      - name: Tests
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+      - name: Installer tests
+        env:
+          MTDD_INSTALLER_INTEGRATION_BINARY: build/mtdd
+        run: python3 -m unittest discover -s tests/unit -p 'installer_test.py'
+      - name: Python tooling tests
+        run: |
+          python3 -m unittest discover -s tests/unit -p 'workspace_paths_test.py'
+          python3 -m unittest discover -s tests/unit -p 'monitor_load_test.py'
+          python3 -m unittest discover -s tests/unit -p 'coverage_report_test.py'

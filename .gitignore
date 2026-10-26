@@ -1,0 +1,21 @@
+# Build products and local state
+/build*/
+/.local-build/
+/.cache/
+/runtime/
+*.o
+*.profraw
+*.profdata
+coverage.info
+__pycache__/
+
+# Local credentials and research archives
+/.env
+/.env.*
+/config.local.json
+/users.local.json
+/.private/
+/specs
+
+# Local load-test tooling contains deployment-specific targets and run scripts.
+/tools/loadgen/

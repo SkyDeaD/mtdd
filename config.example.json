@@ -1,0 +1,20 @@
+{
+  "proxy_host": "127.0.0.1",
+  "proxy_port": 14443,
+  "public_host": "proxy.example.org",
+  "control_host": "127.0.0.1",
+  "control_port": 9090,
+  "api_token_env": "MTDD_API_TOKEN",
+  "tls_domain": "example.org",
+  "ad_tag": "REPLACE_WITH_YOUR_32_HEX_AD_TAG",
+  "users_path": "runtime/users.json",
+  "workers": 0,
+  "max_frame_bytes": 2097152,
+  "connection_queue_bytes": 262144,
+  "global_buffer_bytes": 67108864,
+  "handshake_timeout_seconds": 15,
+  "idle_timeout_seconds": 1800,
+  "me_connections_per_dc": 2,
+  "me_clients_per_writer": 1000,
+  "metadata_refresh_seconds": 3600
+}

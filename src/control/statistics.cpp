@@ -1,0 +1,1123 @@
+// Thread-safe runtime statistics with bounded label sets and Prometheus text
+// rendering. No per-packet locks: connection-lifetime handles use atomics.
+#include <mtdd/control.hpp>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace mtdd::control {
+namespace {
+
+constexpr size_t kRejectReasonCount = 6;
+constexpr size_t kHandshakeResultCount = 4;
+constexpr size_t kBufferStateCount = 3;
+constexpr size_t kApiRouteCount = 9;
+constexpr size_t kApiMethodCount = 5;
+constexpr size_t kApiStatusCount = 14;
+constexpr size_t kMeSlotCount = 13;  // -203, -5..-1, 1..5, 203, other
+
+constexpr std::array<const char*, kRejectReasonCount> kRejectLabels = {
+    "overload", "rate_limited", "auth_failed",
+    "handshake_timeout", "invalid_request", "other"};
+
+constexpr std::array<const char*, kHandshakeResultCount> kHandshakeLabels = {
+    "success", "failure", "timeout", "replay"};
+
+constexpr std::array<const char*, kBufferStateCount> kBufferLabels = {
+    "queued", "pending_write", "relay"};
+
+constexpr std::array<const char*, kApiRouteCount> kApiRouteLabels = {
+    "/v1/health", "/v1/ready", "/v1/status", "/v1/users",
+    "/v1/users/{name}", "/v1/users/{name}/rotate-secret", "/metrics", "unknown",
+    "/v1/users/{name}/links"};
+
+constexpr std::array<const char*, kApiMethodCount> kApiMethodLabels = {
+    "GET", "POST", "PATCH", "DELETE", "OTHER"};
+
+// Bounded status labels. Unknown statuses are aggregated under 500.
+constexpr std::array<int, kApiStatusCount> kApiStatusCodes = {
+    200, 201, 202, 400, 401, 403, 404, 405, 409, 412, 413, 429, 500, 503};
+constexpr std::array<const char*, kApiStatusCount> kApiStatusLabels = {
+    "200", "201", "202", "400", "401", "403", "404",
+    "405", "409", "412", "413", "429", "500", "503"};
+
+constexpr std::array<const char*, kMeSlotCount> kMeLabels = {
+    "-203", "-5", "-4", "-3", "-2", "-1", "1",
+    "2",    "3",  "4",  "5",  "203", "other"};
+
+size_t reject_index(RejectReason reason) {
+  switch (reason) {
+    case RejectReason::overload: return 0;
+    case RejectReason::rate_limited: return 1;
+    case RejectReason::auth_failed: return 2;
+    case RejectReason::handshake_timeout: return 3;
+    case RejectReason::invalid_request: return 4;
+    case RejectReason::other: return 5;
+  }
+  return 5;
+}
+
+size_t handshake_index(HandshakeResult result) {
+  switch (result) {
+    case HandshakeResult::success: return 0;
+    case HandshakeResult::failure: return 1;
+    case HandshakeResult::timeout: return 2;
+    case HandshakeResult::replay: return 3;
+  }
+  return 1;
+}
+
+size_t buffer_index(BufferState state) {
+  switch (state) {
+    case BufferState::queued: return 0;
+    case BufferState::pending_write: return 1;
+    case BufferState::relay: return 2;
+  }
+  return 0;
+}
+
+size_t route_index(ApiRoute route) {
+  switch (route) {
+    case ApiRoute::health: return 0;
+    case ApiRoute::ready: return 1;
+    case ApiRoute::status: return 2;
+    case ApiRoute::users: return 3;
+    case ApiRoute::user: return 4;
+    case ApiRoute::rotate_secret: return 5;
+    case ApiRoute::metrics: return 6;
+    case ApiRoute::unknown: return 7;
+    case ApiRoute::user_links: return 8;
+  }
+  return 7;
+}
+
+size_t method_index(ApiMethod method) {
+  switch (method) {
+    case ApiMethod::get: return 0;
+    case ApiMethod::post: return 1;
+    case ApiMethod::patch: return 2;
+    case ApiMethod::delete_: return 3;
+    case ApiMethod::other: return 4;
+  }
+  return 4;
+}
+
+size_t status_index(int status) {
+  for (size_t i = 0; i < kApiStatusCodes.size(); ++i) {
+    if (kApiStatusCodes[i] == status) return i;
+  }
+  for (size_t i = 0; i < kApiStatusCodes.size(); ++i) {
+    if (kApiStatusCodes[i] == 500) return i;
+  }
+  return 0;
+}
+
+size_t api_cell(ApiRoute route, ApiMethod method, int status) {
+  return (route_index(route) * kApiMethodCount + method_index(method)) *
+             kApiStatusCount +
+         status_index(status);
+}
+
+// Bounded signed DC set: -203, -5..-1, 1..5, 203; anything else is "other".
+size_t me_slot(int dc) {
+  if (dc == -203) return 0;
+  if (dc >= -5 && dc <= -1) return static_cast<size_t>(dc + 6);
+  if (dc >= 1 && dc <= 5) return static_cast<size_t>(dc + 5);
+  if (dc == 203) return 11;
+  return kMeSlotCount - 1;
+}
+
+void append_metric(std::ostringstream& out, std::string_view name,
+                   std::string_view labels, uint64_t value) {
+  out << name;
+  if (!labels.empty()) out << '{' << labels << '}';
+  out << ' ' << value << '\n';
+}
+
+}  // namespace
+
+const char* to_string(RejectReason reason) noexcept {
+  return kRejectLabels[reject_index(reason)];
+}
+const char* to_string(HandshakeResult result) noexcept {
+  return kHandshakeLabels[handshake_index(result)];
+}
+const char* to_string(Direction direction) noexcept {
+  return direction == Direction::client_to_server ? "c2s" : "s2c";
+}
+const char* to_string(BufferState state) noexcept {
+  return kBufferLabels[buffer_index(state)];
+}
+const char* to_string(ApiRoute route) noexcept {
+  return kApiRouteLabels[route_index(route)];
+}
+const char* to_string(ApiMethod method) noexcept {
+  return kApiMethodLabels[method_index(method)];
+}
+const char* to_string(MeResult result) noexcept {
+  switch (result) {
+    case MeResult::success: return "success";
+    case MeResult::failure: return "failure";
+    case MeResult::timeout: return "timeout";
+  }
+  return "failure";
+}
+
+void UserMetrics::connection_opened() noexcept {
+  active_.fetch_add(1, std::memory_order_relaxed);
+}
+bool UserMetrics::try_connection_open(uint64_t limit) noexcept {
+  uint64_t current = active_.load(std::memory_order_relaxed);
+  while (current < limit) {
+    if (active_.compare_exchange_weak(current, current + 1,
+                                      std::memory_order_relaxed,
+                                      std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+void UserMetrics::connection_closed() noexcept {
+  uint64_t current = active_.load(std::memory_order_relaxed);
+  while (current > 0 &&
+         !active_.compare_exchange_weak(current, current - 1,
+                                        std::memory_order_relaxed)) {
+  }
+}
+void UserMetrics::add_payload(Direction direction, uint64_t bytes) noexcept {
+  if (direction == Direction::client_to_server) {
+    payload_c2s_.fetch_add(bytes, std::memory_order_relaxed);
+  } else {
+    payload_s2c_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+}
+uint64_t UserMetrics::active_connections() const noexcept {
+  return active_.load(std::memory_order_relaxed);
+}
+void UserMetrics::set_active_unique_ips(uint64_t value) noexcept {
+  unique_ips_.store(value, std::memory_order_relaxed);
+}
+uint64_t UserMetrics::active_unique_ips() const noexcept {
+  return unique_ips_.load(std::memory_order_relaxed);
+}
+uint64_t UserMetrics::payload_c2s_bytes() const noexcept {
+  return payload_c2s_.load(std::memory_order_relaxed);
+}
+uint64_t UserMetrics::payload_s2c_bytes() const noexcept {
+  return payload_s2c_.load(std::memory_order_relaxed);
+}
+
+struct Statistics::Impl {
+  static constexpr size_t kMaxWorkers = 256;
+
+  struct MeSlot {
+    std::atomic<bool> connected{false};
+    std::atomic<uint64_t> reconnects{0};
+    std::atomic<uint64_t> requests_success{0};
+    std::atomic<uint64_t> requests_failure{0};
+    std::atomic<uint64_t> requests_timeout{0};
+    std::atomic<uint64_t> ready_depth{0};
+    std::atomic<uint64_t> ready_clients{0};
+    std::atomic<uint64_t> frames_bytes{0};
+    std::atomic<uint64_t> out_bytes{0};
+    std::atomic<uint64_t> ans_received{0};
+    std::atomic<uint64_t> ans_delivered{0};
+    std::atomic<uint64_t> ans_dropped_unknown{0};
+    std::atomic<uint64_t> ans_dropped_other{0};
+    std::atomic<bool> ans_seen{false};
+    std::atomic<uint64_t> last_ans_age{0};
+    std::atomic<uint64_t> control_close_conn{0};
+    std::atomic<uint64_t> control_close_ext{0};
+    std::atomic<uint64_t> control_unknown{0};
+    std::atomic<uint64_t> control_malformed{0};
+    std::atomic<uint64_t> rx_bytes{0};
+    std::atomic<uint64_t> tx_bytes{0};
+    // Per-reactor ME pool gauges (melife). snapshot() sums the pool sizes and
+    // ready counts, so N reactors never collapse into one pool.
+    std::atomic<uint64_t> pool_connections{0};
+    std::atomic<uint64_t> pool_ready{0};
+    std::atomic<uint64_t> pool_target{0};
+    std::atomic<uint64_t> bound_clients{0};
+    std::atomic<uint64_t> scale_up{0};
+    std::atomic<uint64_t> scale_down{0};
+    std::atomic<uint64_t> creation_failures{0};
+    // Keepalive: per-reactor DC gauge plus process-lifetime counters.
+    std::atomic<uint64_t> ping_sent{0};
+    std::atomic<uint64_t> ping_pong{0};
+    std::atomic<uint64_t> ping_stall{0};
+    std::atomic<uint64_t> ping_timeout{0};
+    std::atomic<uint64_t> ping_rtt_us{0};
+    std::atomic<bool> ping_rtt_valid{false};
+    std::atomic<uint64_t> direct_active{0};
+    std::atomic<uint64_t> direct_accepted{0};
+    std::atomic<uint64_t> direct_fail{0};
+    std::atomic<uint64_t> direct_rx{0};
+    std::atomic<uint64_t> direct_tx{0};
+    std::atomic<uint64_t> direct_budget_pauses{0};
+  };
+
+  // Gauges owned by one reactor. snapshot() sums them (boolean OR for
+  // `connected`, max for the shared replay-cache size, min for the last-answer
+  // age). Process-lifetime ME counters have no owning reactor and are
+  // accumulated in slot 0 with atomics; the snapshot still walks every slot, so
+  // each increment is counted exactly once.
+  struct WorkerGauges {
+    std::atomic<bool> ready{false};
+    std::array<std::atomic<uint64_t>, kBufferStateCount> buffer_bytes;
+    std::atomic<uint64_t> buffer_budget_used{0};
+    std::atomic<uint64_t> handshakes_pending{0};
+    std::atomic<uint64_t> client_pool_objects{0};
+    std::atomic<uint64_t> replay_cache{0};
+    std::atomic<uint64_t> me_pending_bytes{0};
+    std::array<MeSlot, kMeSlotCount> me;  // zero-initialized by MeSlot defaults
+  };
+
+  Impl(size_t max_tracked_users, std::chrono::steady_clock::time_point start)
+      : started_at(start), max_users(std::min(max_tracked_users, kMaxUsersLimit)) {
+    if (max_users == 0) max_users = 1;
+    for (auto& worker : gauges) {
+      for (auto& counter : worker.buffer_bytes) counter.store(0);
+    }
+    for (auto& counter : rejected_by_reason) counter.store(0);
+    for (auto& counter : handshakes) counter.store(0);
+    for (auto& cell : api_cells) cell.store(0);
+  }
+
+  std::chrono::steady_clock::time_point started_at;
+  std::atomic<size_t> worker_count{1};
+  std::array<WorkerGauges, kMaxWorkers> gauges;
+  mutable std::mutex build_mutex;
+  std::string build_version;
+  std::atomic<uint64_t> accepted{0};
+  std::atomic<uint64_t> active{0};
+  std::atomic<uint64_t> unique_ips{0};
+  std::atomic<uint64_t> rejected{0};
+  mutable std::mutex users_mutex;
+  std::unordered_map<std::string, std::shared_ptr<UserMetrics>> users;
+  size_t max_users;
+  std::atomic<uint64_t> client_allocations{0};
+  std::atomic<uint64_t> client_reuses{0};
+  std::atomic<uint64_t> backpressure_c2s{0};
+  std::atomic<uint64_t> backpressure_s2c{0};
+  std::array<std::atomic<uint64_t>, kApiRouteCount * kApiMethodCount * kApiStatusCount>
+      api_cells;
+  std::atomic<uint64_t> api_total{0};
+  std::array<std::atomic<uint64_t>, kRejectReasonCount> rejected_by_reason;
+  std::array<std::atomic<uint64_t>, kHandshakeResultCount> handshakes;
+  std::unique_ptr<IpHistory> ip_history;
+  std::atomic<uint64_t> ip_history_failures{0};
+};
+
+
+Statistics::Statistics(size_t max_tracked_users)
+    : impl_(std::make_unique<Impl>(max_tracked_users,
+                                   std::chrono::steady_clock::now())) {}
+
+Statistics::~Statistics() = default;
+Statistics::Statistics(Statistics&&) noexcept = default;
+Statistics& Statistics::operator=(Statistics&&) noexcept = default;
+
+void Statistics::configure_workers(std::size_t workers) noexcept {
+  if (workers == 0) workers = 1;
+  if (workers > Statistics::Impl::kMaxWorkers) {
+    workers = Statistics::Impl::kMaxWorkers;
+  }
+  impl_->worker_count.store(workers, std::memory_order_relaxed);
+}
+
+void Statistics::set_ready(bool ready) noexcept {
+  impl_->gauges[0].ready.store(ready, std::memory_order_relaxed);
+}
+void Statistics::set_ready(std::size_t worker, bool ready) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].ready.store(ready, std::memory_order_relaxed);
+}
+bool Statistics::ready() const noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  for (std::size_t worker = 0; worker < count; ++worker) {
+    if (!impl_->gauges[worker].ready.load(std::memory_order_relaxed)) return false;
+  }
+  return true;
+}
+void Statistics::set_build_info(std::string version) {
+  std::lock_guard<std::mutex> lock(impl_->build_mutex);
+  impl_->build_version = std::move(version);
+}
+
+void Statistics::connection_accepted() noexcept {
+  impl_->accepted.fetch_add(1, std::memory_order_relaxed);
+  impl_->active.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::connection_closed() noexcept {
+  uint64_t current = impl_->active.load(std::memory_order_relaxed);
+  while (current > 0 &&
+         !impl_->active.compare_exchange_weak(current, current - 1,
+                                              std::memory_order_relaxed)) {
+  }
+}
+void Statistics::connection_rejected(RejectReason reason) noexcept {
+  impl_->rejected.fetch_add(1, std::memory_order_relaxed);
+  impl_->rejected_by_reason[reject_index(reason)].fetch_add(
+      1, std::memory_order_relaxed);
+}
+void Statistics::handshake(HandshakeResult result) noexcept {
+  impl_->handshakes[handshake_index(result)].fetch_add(1,
+                                                       std::memory_order_relaxed);
+}
+
+std::shared_ptr<UserMetrics> Statistics::user(std::string_view name) {
+  // Do not let unvalidated caller input create attacker-chosen label series.
+  if (!UserStore::is_valid_name(name)) return nullptr;
+  std::lock_guard<std::mutex> lock(impl_->users_mutex);
+  const auto existing = impl_->users.find(std::string(name));
+  if (existing != impl_->users.end()) return existing->second;
+  if (impl_->users.size() >= impl_->max_users) return nullptr;
+  auto metrics = std::make_shared<UserMetrics>();
+  impl_->users.emplace(std::string(name), metrics);
+  return metrics;
+}
+
+void Statistics::forget_user(std::string_view name) noexcept {
+  std::lock_guard<std::mutex> lock(impl_->users_mutex);
+  impl_->users.erase(std::string(name));
+}
+
+void Statistics::set_active_unique_ips(uint64_t value) noexcept {
+  impl_->unique_ips.store(value, std::memory_order_relaxed);
+}
+
+void Statistics::enable_ip_history(std::string path) {
+  if (impl_->ip_history) {
+    throw std::logic_error("IP history is already enabled");
+  }
+  impl_->ip_history =
+      std::make_unique<IpHistory>(std::filesystem::path(std::move(path)));
+}
+
+bool Statistics::rotate_ip_history(int64_t unix_seconds) noexcept {
+  if (!impl_->ip_history) return false;
+  try {
+    return impl_->ip_history->rotate(unix_seconds);
+  } catch (...) {
+    impl_->ip_history_failures.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+}
+
+bool Statistics::observe_ip_history(const std::array<std::uint8_t, 16>& ip) noexcept {
+  if (!impl_->ip_history) return false;
+  try {
+    const bool observed = impl_->ip_history->observe(ip);
+    if (!observed) {
+      impl_->ip_history_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    return observed;
+  } catch (...) {
+    impl_->ip_history_failures.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+}
+
+void Statistics::set_buffer_bytes(BufferState state, uint64_t bytes) noexcept {
+  set_buffer_bytes(0, state, bytes);
+}
+void Statistics::set_buffer_bytes(std::size_t worker, BufferState state,
+                                  uint64_t bytes) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].buffer_bytes[buffer_index(state)].store(
+      bytes, std::memory_order_relaxed);
+}
+void Statistics::set_buffer_budget_used(uint64_t bytes) noexcept {
+  set_buffer_budget_used(0, bytes);
+}
+void Statistics::set_buffer_budget_used(std::size_t worker,
+                                        uint64_t bytes) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].buffer_budget_used.store(
+      bytes, std::memory_order_relaxed);
+}
+void Statistics::set_handshakes_pending(uint64_t value) noexcept {
+  set_handshakes_pending(0, value);
+}
+void Statistics::set_handshakes_pending(std::size_t worker,
+                                        uint64_t value) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].handshakes_pending.store(
+      value, std::memory_order_relaxed);
+}
+void Statistics::set_client_pool(uint64_t pooled, uint64_t allocations,
+                                 uint64_t reuses) noexcept {
+  set_client_pool(0, pooled, allocations, reuses);
+}
+void Statistics::set_client_pool(std::size_t worker, uint64_t pooled,
+                                 uint64_t allocations,
+                                 uint64_t reuses) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].client_pool_objects.store(
+      pooled, std::memory_order_relaxed);
+  // Allocation/reuse counters are process-lifetime telemetry shared by every
+  // reactor; store the latest cumulative value instead of summing N copies.
+  impl_->client_allocations.store(allocations, std::memory_order_relaxed);
+  impl_->client_reuses.store(reuses, std::memory_order_relaxed);
+}
+void Statistics::add_backpressure(Direction direction) noexcept {
+  if (direction == Direction::client_to_server) {
+    impl_->backpressure_c2s.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    impl_->backpressure_s2c.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+void Statistics::set_replay_cache_entries(uint64_t entries) noexcept {
+  set_replay_cache_entries(0, entries);
+}
+void Statistics::set_replay_cache_entries(std::size_t worker,
+                                          uint64_t entries) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].replay_cache.store(
+      entries, std::memory_order_relaxed);
+}
+
+void Statistics::api_request(ApiRoute route, ApiMethod method, int status) noexcept {
+  impl_->api_total.fetch_add(1, std::memory_order_relaxed);
+  impl_->api_cells[api_cell(route, method, status)].fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void Statistics::me_connected(int dc, bool connected) noexcept {
+  me_connected(0, dc, connected);
+}
+void Statistics::me_connected(std::size_t worker, int dc,
+                              bool connected) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  // Only the connectivity flag. Inbound control counters are cumulative per DC
+  // and owned by the reactor (which folds replaced connections into a base), so
+  // a disconnected transition must not erase them.
+  slot.connected.store(connected, std::memory_order_relaxed);
+}
+void Statistics::me_reconnect(int dc) noexcept {
+  // Process-lifetime ME counters are not owned by a reactor, so every reactor
+  // accumulates them in slot 0. snapshot() sums slots exactly once, and the
+  // increments are atomic, so N reactors cannot multiply a total.
+  impl_->gauges[0].me[me_slot(dc)].reconnects.fetch_add(
+      1, std::memory_order_relaxed);
+}
+void Statistics::me_request(int dc, MeResult result) noexcept {
+  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  switch (result) {
+    case MeResult::success:
+      slot.requests_success.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case MeResult::failure:
+      slot.requests_failure.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case MeResult::timeout:
+      slot.requests_timeout.fetch_add(1, std::memory_order_relaxed);
+      break;
+  }
+}
+void Statistics::me_answer(int dc, MeAnswerResult result) noexcept {
+  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  switch (result) {
+    case MeAnswerResult::received:
+      slot.ans_received.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case MeAnswerResult::delivered:
+      slot.ans_delivered.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case MeAnswerResult::dropped_unknown:
+      slot.ans_dropped_unknown.fetch_add(1, std::memory_order_relaxed);
+      break;
+    case MeAnswerResult::dropped_other:
+      slot.ans_dropped_other.fetch_add(1, std::memory_order_relaxed);
+      break;
+  }
+}
+void Statistics::me_control(int dc, uint64_t close_conn, uint64_t close_ext,
+                            uint64_t unknown, uint64_t malformed) noexcept {
+  me_control(0, dc, close_conn, close_ext, unknown, malformed);
+}
+void Statistics::me_control(std::size_t worker, int dc, uint64_t close_conn,
+                            uint64_t close_ext, uint64_t unknown,
+                            uint64_t malformed) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.control_close_conn.store(close_conn, std::memory_order_relaxed);
+  slot.control_close_ext.store(close_ext, std::memory_order_relaxed);
+  slot.control_unknown.store(unknown, std::memory_order_relaxed);
+  slot.control_malformed.store(malformed, std::memory_order_relaxed);
+}
+void Statistics::me_queue(int dc, uint64_t depth, uint64_t clients,
+                          uint64_t frames_bytes, uint64_t out_bytes) noexcept {
+  me_queue(0, dc, depth, clients, frames_bytes, out_bytes);
+}
+void Statistics::me_queue(std::size_t worker, int dc, uint64_t depth,
+                          uint64_t clients, uint64_t frames_bytes,
+                          uint64_t out_bytes) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.ready_depth.store(depth, std::memory_order_relaxed);
+  slot.ready_clients.store(clients, std::memory_order_relaxed);
+  slot.frames_bytes.store(frames_bytes, std::memory_order_relaxed);
+  slot.out_bytes.store(out_bytes, std::memory_order_relaxed);
+}
+void Statistics::direct_budget_pause(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].direct_budget_pauses.fetch_add(
+      1, std::memory_order_relaxed);
+}
+void Statistics::me_direct(int dc, uint64_t active, uint64_t accepted,
+                           uint64_t connect_fail, uint64_t rx_bytes,
+                           uint64_t tx_bytes) noexcept {
+  me_direct(0, dc, active, accepted, connect_fail, rx_bytes, tx_bytes);
+}
+void Statistics::me_direct(std::size_t worker, int dc, uint64_t active,
+                           uint64_t accepted, uint64_t connect_fail,
+                           uint64_t rx_bytes, uint64_t tx_bytes) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.direct_active.store(active, std::memory_order_relaxed);
+  slot.direct_accepted.store(accepted, std::memory_order_relaxed);
+  slot.direct_fail.store(connect_fail, std::memory_order_relaxed);
+  slot.direct_rx.store(rx_bytes, std::memory_order_relaxed);
+  slot.direct_tx.store(tx_bytes, std::memory_order_relaxed);
+}
+void Statistics::me_io(int dc, uint64_t rx_bytes_total,
+                       uint64_t tx_bytes_total) noexcept {
+  me_io(0, dc, rx_bytes_total, tx_bytes_total);
+}
+void Statistics::me_io(std::size_t worker, int dc, uint64_t rx_bytes_total,
+                       uint64_t tx_bytes_total) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.rx_bytes.store(rx_bytes_total, std::memory_order_relaxed);
+  slot.tx_bytes.store(tx_bytes_total, std::memory_order_relaxed);
+}
+void Statistics::me_last_answer_age(int dc, uint64_t age_seconds) noexcept {
+  me_last_answer_age(0, dc, age_seconds);
+}
+void Statistics::me_last_answer_age(std::size_t worker, int dc,
+                                    uint64_t age_seconds) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.last_ans_age.store(age_seconds, std::memory_order_relaxed);
+  slot.ans_seen.store(true, std::memory_order_relaxed);
+}
+void Statistics::me_last_answer_clear(int dc) noexcept {
+  me_last_answer_clear(0, dc);
+}
+void Statistics::me_last_answer_clear(std::size_t worker, int dc) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  // Order matters for a concurrent reader: drop the age first, then the flag,
+  // so a snapshot can never pair "seen" with a stale age. The other order can
+  // only produce "not seen", which is the value we are publishing anyway.
+  slot.last_ans_age.store(0, std::memory_order_relaxed);
+  slot.ans_seen.store(false, std::memory_order_relaxed);
+}
+void Statistics::me_pool(int dc, uint64_t connections, uint64_t ready) noexcept {
+  me_pool(0, dc, connections, ready);
+}
+void Statistics::me_pool(std::size_t worker, int dc, uint64_t connections,
+                         uint64_t ready) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.pool_connections.store(connections, std::memory_order_relaxed);
+  slot.pool_ready.store(ready, std::memory_order_relaxed);
+}
+void Statistics::me_pool_scaling(std::size_t worker, int dc, uint64_t target,
+                                 uint64_t clients, uint64_t up, uint64_t down,
+                                 uint64_t failures) noexcept {
+  const auto count = impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.pool_target.store(target, std::memory_order_relaxed);
+  slot.bound_clients.store(clients, std::memory_order_relaxed);
+  slot.scale_up.store(up, std::memory_order_relaxed);
+  slot.scale_down.store(down, std::memory_order_relaxed);
+  slot.creation_failures.store(failures, std::memory_order_relaxed);
+}
+void Statistics::me_ping_sent(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].ping_sent.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::me_ping_pong(int dc, uint64_t rtt_us) noexcept {
+  // Only the counter is process-lifetime; the RTT gauge is reactor-owned and
+  // published by me_ping_rtt()/publish_me_rtt() as the pool aggregate.
+  (void)rtt_us;
+  impl_->gauges[0].me[me_slot(dc)].ping_pong.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::me_ping_rtt(int dc, uint64_t rtt_us) noexcept {
+  me_ping_rtt(0, dc, rtt_us);
+}
+void Statistics::me_ping_rtt(std::size_t worker, int dc, uint64_t rtt_us) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me[me_slot(dc)];
+  slot.ping_rtt_us.store(rtt_us, std::memory_order_relaxed);
+  slot.ping_rtt_valid.store(true, std::memory_order_relaxed);
+}
+void Statistics::me_ping_stall(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].ping_stall.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::me_ping_timeout(int dc) noexcept {
+  impl_->gauges[0].me[me_slot(dc)].ping_timeout.fetch_add(1, std::memory_order_relaxed);
+}
+void Statistics::me_pending_buffer_bytes(uint64_t bytes) noexcept {
+  me_pending_buffer_bytes(0, bytes);
+}
+void Statistics::me_pending_buffer_bytes(std::size_t worker,
+                                         uint64_t bytes) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].me_pending_bytes.store(
+      bytes, std::memory_order_relaxed);
+}
+
+StatisticsSnapshot Statistics::snapshot() const {
+  StatisticsSnapshot out;
+  {
+    std::lock_guard<std::mutex> lock(impl_->build_mutex);
+    out.build_version = impl_->build_version;
+  }
+  out.uptime_seconds = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::steady_clock::now() - impl_->started_at)
+          .count());
+  out.ready = ready();
+  const std::size_t workers =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  out.connections_accepted_total =
+      impl_->accepted.load(std::memory_order_relaxed);
+  out.connections_active = impl_->active.load(std::memory_order_relaxed);
+  out.active_unique_ips = impl_->unique_ips.load(std::memory_order_relaxed);
+  out.connections_rejected_total =
+      impl_->rejected.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < kRejectReasonCount; ++i) {
+    const uint64_t value =
+        impl_->rejected_by_reason[i].load(std::memory_order_relaxed);
+    if (value != 0) out.rejected_by_reason[kRejectLabels[i]] = value;
+  }
+  for (size_t i = 0; i < kHandshakeResultCount; ++i) {
+    const uint64_t value = impl_->handshakes[i].load(std::memory_order_relaxed);
+    if (value != 0) out.handshakes_by_result[kHandshakeLabels[i]] = value;
+  }
+  {
+    std::lock_guard<std::mutex> lock(impl_->users_mutex);
+    for (const auto& [name, metrics] : impl_->users) {
+      UserMetricsSnapshot entry;
+      entry.active_connections = metrics->active_connections();
+      entry.unique_ips_active = metrics->active_unique_ips();
+      entry.payload_c2s_bytes = metrics->payload_c2s_bytes();
+      entry.payload_s2c_bytes = metrics->payload_s2c_bytes();
+      out.users.emplace(name, entry);
+    }
+  }
+  for (size_t i = 0; i < kBufferStateCount; ++i) out.buffer_bytes[i] = 0;
+  uint64_t buffer_budget_used = 0;
+  uint64_t handshakes_pending = 0;
+  uint64_t client_pool_objects = 0;
+  uint64_t replay_entries = 0;
+  uint64_t me_pending_bytes = 0;
+  for (std::size_t worker = 0; worker < workers; ++worker) {
+    const auto& gauges = impl_->gauges[worker];
+    for (size_t i = 0; i < kBufferStateCount; ++i) {
+      out.buffer_bytes[i] += gauges.buffer_bytes[i].load(std::memory_order_relaxed);
+    }
+    buffer_budget_used +=
+        gauges.buffer_budget_used.load(std::memory_order_relaxed);
+    handshakes_pending +=
+        gauges.handshakes_pending.load(std::memory_order_relaxed);
+    client_pool_objects +=
+        gauges.client_pool_objects.load(std::memory_order_relaxed);
+    // The replay cache is shared by every reactor, so all workers publish the
+    // same size: take the maximum instead of summing N copies.
+    replay_entries = std::max(
+        replay_entries, gauges.replay_cache.load(std::memory_order_relaxed));
+    me_pending_bytes +=
+        gauges.me_pending_bytes.load(std::memory_order_relaxed);
+  }
+  out.backpressure_c2s_total =
+      impl_->backpressure_c2s.load(std::memory_order_relaxed);
+  out.backpressure_s2c_total =
+      impl_->backpressure_s2c.load(std::memory_order_relaxed);
+  out.replay_cache_entries = replay_entries;
+  out.api_requests_total = impl_->api_total.load(std::memory_order_relaxed);
+  out.me_pending_buffer_bytes = me_pending_bytes;
+  out.buffer_budget_used = buffer_budget_used;
+  out.handshakes_pending = handshakes_pending;
+  out.client_pool_objects = client_pool_objects;
+  out.client_allocations_total =
+      impl_->client_allocations.load(std::memory_order_relaxed);
+  out.client_reuses_total =
+      impl_->client_reuses.load(std::memory_order_relaxed);
+  if (impl_->ip_history) out.unique_ip_history = impl_->ip_history->snapshot();
+  out.ip_history_observation_failures =
+      impl_->ip_history_failures.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < kMeSlotCount; ++i) {
+    MeDcSnapshot entry;
+    bool answer_seen = false;
+    uint64_t min_answer_age = 0;
+    uint64_t rtt_sum = 0;
+    uint64_t rtt_samples = 0;
+    for (std::size_t worker = 0; worker < workers; ++worker) {
+      const auto& slot = impl_->gauges[worker].me[i];
+      // One ME pool per reactor: pool sizes and ready members add up, while
+      // the reactor count is the number of slots that currently have a ready
+      // connection (the honest multi-reactor topology gauge).
+      const bool slot_connected = slot.connected.load(std::memory_order_relaxed);
+      entry.connected = entry.connected || slot_connected;
+      if (slot_connected) ++entry.reactors_connected;
+      entry.connections +=
+          slot.pool_connections.load(std::memory_order_relaxed);
+      entry.ready_connections +=
+          slot.pool_ready.load(std::memory_order_relaxed);
+      entry.pool_target += slot.pool_target.load(std::memory_order_relaxed);
+      entry.bound_clients += slot.bound_clients.load(std::memory_order_relaxed);
+      entry.scale_up_total += slot.scale_up.load(std::memory_order_relaxed);
+      entry.scale_down_total += slot.scale_down.load(std::memory_order_relaxed);
+      entry.creation_failures_total += slot.creation_failures.load(std::memory_order_relaxed);
+      // Only reactors whose pool currently has a ready member contribute to
+      // the DC RTT mean: an emptied pool keeps its last value for diagnostics
+      // but must not dilute the aggregate.
+      if (slot.ping_rtt_valid.load(std::memory_order_relaxed) &&
+          slot.pool_ready.load(std::memory_order_relaxed) != 0) {
+        rtt_sum += slot.ping_rtt_us.load(std::memory_order_relaxed);
+        ++rtt_samples;
+      }
+      entry.pings_sent_total +=
+          slot.ping_sent.load(std::memory_order_relaxed);
+      entry.pongs_received_total +=
+          slot.ping_pong.load(std::memory_order_relaxed);
+      entry.ping_timeouts_total +=
+          slot.ping_timeout.load(std::memory_order_relaxed);
+      entry.ping_stalls_total +=
+          slot.ping_stall.load(std::memory_order_relaxed);
+      entry.reconnects_total +=
+          slot.reconnects.load(std::memory_order_relaxed);
+      entry.requests_success +=
+          slot.requests_success.load(std::memory_order_relaxed);
+      entry.requests_failure +=
+          slot.requests_failure.load(std::memory_order_relaxed);
+      entry.requests_timeout +=
+          slot.requests_timeout.load(std::memory_order_relaxed);
+      entry.ready_queue_depth +=
+          slot.ready_depth.load(std::memory_order_relaxed);
+      entry.ready_queue_clients +=
+          slot.ready_clients.load(std::memory_order_relaxed);
+      entry.frames_queued_bytes +=
+          slot.frames_bytes.load(std::memory_order_relaxed);
+      entry.out_queued_bytes +=
+          slot.out_bytes.load(std::memory_order_relaxed);
+      entry.proxy_ans_received_total +=
+          slot.ans_received.load(std::memory_order_relaxed);
+      entry.proxy_ans_delivered_total +=
+          slot.ans_delivered.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_unknown_total +=
+          slot.ans_dropped_unknown.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_other_total +=
+          slot.ans_dropped_other.load(std::memory_order_relaxed);
+      if (slot.ans_seen.load(std::memory_order_relaxed)) {
+        const uint64_t age =
+            slot.last_ans_age.load(std::memory_order_relaxed);
+        if (!answer_seen || age < min_answer_age) min_answer_age = age;
+        answer_seen = true;
+      }
+      entry.control_close_conn +=
+          slot.control_close_conn.load(std::memory_order_relaxed);
+      entry.control_close_ext +=
+          slot.control_close_ext.load(std::memory_order_relaxed);
+      entry.control_unknown +=
+          slot.control_unknown.load(std::memory_order_relaxed);
+      entry.control_malformed +=
+          slot.control_malformed.load(std::memory_order_relaxed);
+      entry.rx_bytes_total +=
+          slot.rx_bytes.load(std::memory_order_relaxed);
+      entry.tx_bytes_total +=
+          slot.tx_bytes.load(std::memory_order_relaxed);
+      entry.direct_active +=
+          slot.direct_active.load(std::memory_order_relaxed);
+      entry.direct_accepted_total +=
+          slot.direct_accepted.load(std::memory_order_relaxed);
+      entry.direct_connect_fail_total +=
+          slot.direct_fail.load(std::memory_order_relaxed);
+      entry.direct_rx_bytes_total +=
+          slot.direct_rx.load(std::memory_order_relaxed);
+      entry.direct_tx_bytes_total +=
+          slot.direct_tx.load(std::memory_order_relaxed);
+      entry.direct_budget_pauses_total +=
+          slot.direct_budget_pauses.load(std::memory_order_relaxed);
+    }
+    entry.ping_rtt_us = rtt_samples == 0 ? 0 : rtt_sum / rtt_samples;
+    entry.proxy_ans_seen = answer_seen;
+    entry.last_proxy_ans_age_seconds = answer_seen ? min_answer_age : 0;
+    out.me_dcs.emplace(kMeLabels[i], entry);
+  }
+  return out;
+}
+
+std::string Statistics::escape_label(std::string_view value) {
+  std::string out;
+  out.reserve(value.size() + 8);
+  for (char c : value) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+std::string Statistics::prometheus_text() const {
+  const StatisticsSnapshot snapshot = this->snapshot();
+  std::ostringstream out;
+
+  out << "# HELP mtdd_build_info Build information.\n";
+  out << "# TYPE mtdd_build_info gauge\n";
+  out << "mtdd_build_info{version=\""
+      << escape_label(snapshot.build_version) << "\"} 1\n";
+  append_metric(out, "mtdd_uptime_seconds", "", snapshot.uptime_seconds);
+  append_metric(out, "mtdd_connections_active", "", snapshot.connections_active);
+  append_metric(out, "mtdd_unique_ips_active", "", snapshot.active_unique_ips);
+  const auto& history = snapshot.unique_ip_history;
+  append_metric(out, "mtdd_unique_ips_estimate", "period=\"hour\"", history.hour);
+  append_metric(out, "mtdd_unique_ips_estimate", "period=\"day\"", history.day);
+  append_metric(out, "mtdd_unique_ips_estimate", "period=\"week\"", history.week);
+  append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"hour\"",
+                static_cast<uint64_t>(history.hour_started_at));
+  append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"day\"",
+                static_cast<uint64_t>(history.day_started_at));
+  append_metric(out, "mtdd_unique_ips_period_start_seconds", "period=\"week\"",
+                static_cast<uint64_t>(history.week_started_at));
+  append_metric(out, "mtdd_unique_ips_collection_started_seconds", "",
+                static_cast<uint64_t>(history.collection_started_at));
+  append_metric(out, "mtdd_unique_ips_checkpoint_failures_total", "",
+                history.persistence_failures);
+  append_metric(out, "mtdd_unique_ips_observation_failures_total", "",
+                snapshot.ip_history_observation_failures);
+  append_metric(out, "mtdd_connections_accepted_total", "",
+                snapshot.connections_accepted_total);
+  for (const auto& [reason, value] : snapshot.rejected_by_reason) {
+    append_metric(out, "mtdd_connections_rejected_total",
+                  "reason=\"" + escape_label(reason) + "\"", value);
+  }
+  for (const auto& [result, value] : snapshot.handshakes_by_result) {
+    append_metric(out, "mtdd_handshakes_total",
+                  "result=\"" + escape_label(result) + "\"", value);
+  }
+  for (const auto& [name, metrics] : snapshot.users) {
+    const std::string label = "user=\"" + escape_label(name) + "\"";
+    append_metric(out, "mtdd_user_connections_active", label,
+                  metrics.active_connections);
+    append_metric(out, "mtdd_user_unique_ips_active", label,
+                  metrics.unique_ips_active);
+    append_metric(out, "mtdd_user_payload_bytes_received_total",
+                  label + ",direction=\"c2s\"", metrics.payload_c2s_bytes);
+    append_metric(out, "mtdd_user_payload_bytes_received_total",
+                  label + ",direction=\"s2c\"", metrics.payload_s2c_bytes);
+  }
+  for (size_t i = 0; i < kBufferStateCount; ++i) {
+    append_metric(out, "mtdd_buffer_bytes",
+                  std::string("state=\"") + kBufferLabels[i] + "\"",
+                  snapshot.buffer_bytes[i]);
+  }
+  if (snapshot.backpressure_c2s_total != 0) {
+    append_metric(out, "mtdd_backpressure_events_total", "direction=\"c2s\"",
+                  snapshot.backpressure_c2s_total);
+  }
+  if (snapshot.backpressure_s2c_total != 0) {
+    append_metric(out, "mtdd_backpressure_events_total", "direction=\"s2c\"",
+                  snapshot.backpressure_s2c_total);
+  }
+  append_metric(out, "mtdd_replay_cache_entries",
+                "", snapshot.replay_cache_entries);
+
+  for (size_t r = 0; r < kApiRouteCount; ++r) {
+    for (size_t m = 0; m < kApiMethodCount; ++m) {
+      for (size_t s = 0; s < kApiStatusCount; ++s) {
+        const uint64_t value =
+            impl_->api_cells[(r * kApiMethodCount + m) * kApiStatusCount + s]
+                .load(std::memory_order_relaxed);
+        if (value == 0) continue;
+        std::string labels = "route=\"";
+        labels += kApiRouteLabels[r];
+        labels += "\",method=\"";
+        labels += kApiMethodLabels[m];
+        labels += "\",status=\"";
+        labels += kApiStatusLabels[s];
+        labels += "\"";
+        append_metric(out, "mtdd_api_requests_total", labels, value);
+      }
+    }
+  }
+
+  for (size_t i = 0; i < kMeSlotCount; ++i) {
+    const auto found = snapshot.me_dcs.find(kMeLabels[i]);
+    if (found == snapshot.me_dcs.end()) continue;
+    const MeDcSnapshot& me = found->second;
+    const std::string dc_label = std::string("dc=\"") + kMeLabels[i] + "\"";
+    append_metric(out, "mtdd_me_connected", dc_label, me.connected ? 1 : 0);
+    // ME sockets across every reactor's pool: the historical meaning of this
+    // series (under `workers` it counted ME connections, not reactors). With N
+    // reactors and `me_connections_per_dc` M this is N*M while the pool is full.
+    append_metric(out, "mtdd_me_connections", dc_label, me.connections);
+    // Reactors that currently hold a ready ME connection for this DC. This is a
+    // topology gauge, not a connection count; it used to be published under
+    // `mtdd_me_connections` between workers and melife.
+    append_metric(out, "mtdd_me_ready_reactors", dc_label,
+                  me.reactors_connected);
+    // Deprecated alias of mtdd_me_connections, kept for dashboards written
+    // against the intermediate pool-split naming.
+    append_metric(out, "mtdd_me_pool_connections", dc_label, me.connections);
+    append_metric(out, "mtdd_me_pool_ready", dc_label, me.ready_connections);
+    append_metric(out, "mtdd_me_pool_target", dc_label, me.pool_target);
+    append_metric(out, "mtdd_me_bound_clients", dc_label, me.bound_clients);
+    append_metric(out, "mtdd_me_scale_up_total", dc_label, me.scale_up_total);
+    append_metric(out, "mtdd_me_scale_down_total", dc_label, me.scale_down_total);
+    append_metric(out, "mtdd_me_creation_failures_total", dc_label, me.creation_failures_total);
+    if (me.pings_sent_total != 0) {
+      append_metric(out, "mtdd_me_pings_total",
+                    dc_label + ",result=\"sent\"", me.pings_sent_total);
+    }
+    if (me.pongs_received_total != 0) {
+      append_metric(out, "mtdd_me_pings_total",
+                    dc_label + ",result=\"pong\"", me.pongs_received_total);
+    }
+    if (me.ping_timeouts_total != 0) {
+      append_metric(out, "mtdd_me_pings_total",
+                    dc_label + ",result=\"timeout\"", me.ping_timeouts_total);
+    }
+    if (me.ping_stalls_total != 0) {
+      append_metric(out, "mtdd_me_pings_total",
+                    dc_label + ",result=\"stalled\"", me.ping_stalls_total);
+    }
+    if (me.pongs_received_total != 0) {
+      append_metric(out, "mtdd_me_ping_rtt_us", dc_label, me.ping_rtt_us);
+    }
+    if (me.reconnects_total != 0) {
+      append_metric(out, "mtdd_me_reconnects_total", dc_label,
+                    me.reconnects_total);
+    }
+    const std::pair<const char*, uint64_t> requests[] = {
+        {"success", me.requests_success},
+        {"failure", me.requests_failure},
+        {"timeout", me.requests_timeout},
+    };
+    for (const auto& [result, value] : requests) {
+      if (value == 0) continue;
+      append_metric(out, "mtdd_me_requests_total",
+                    dc_label + ",result=\"" + result + "\"", value);
+    }
+    append_metric(out, "mtdd_me_ready_queue_depth", dc_label,
+                  me.ready_queue_depth);
+    append_metric(out, "mtdd_me_ready_queue_clients", dc_label,
+                  me.ready_queue_clients);
+    append_metric(out, "mtdd_me_frames_queued_bytes", dc_label,
+                  me.frames_queued_bytes);
+    append_metric(out, "mtdd_me_out_queued_bytes", dc_label,
+                  me.out_queued_bytes);
+    // Answer counters are the only delivery claim; queue gauges are not.
+    const std::pair<const char*, uint64_t> answers[] = {
+        {"received", me.proxy_ans_received_total},
+        {"delivered", me.proxy_ans_delivered_total},
+    };
+    for (const auto& [result, value] : answers) {
+      if (value == 0) continue;
+      append_metric(out, "mtdd_me_proxy_ans_total",
+                    dc_label + ",result=\"" + result + "\"", value);
+    }
+    const std::pair<const char*, uint64_t> dropped[] = {
+        {"unknown_client", me.proxy_ans_dropped_unknown_total},
+        {"other", me.proxy_ans_dropped_other_total},
+    };
+    for (const auto& [reason, value] : dropped) {
+      if (value == 0) continue;
+      append_metric(out, "mtdd_me_proxy_ans_dropped_total",
+                    dc_label + ",reason=\"" + reason + "\"", value);
+    }
+    if (me.proxy_ans_seen) {
+      append_metric(out, "mtdd_me_last_proxy_ans_age_seconds", dc_label,
+                    me.last_proxy_ans_age_seconds);
+    }
+    // Inbound control constructors accumulated per DC. Counters: a replaced
+    // connection folds its mirror into the DC base, so the series is monotone.
+    const std::pair<const char*, uint64_t> control[] = {
+        {"close_conn", me.control_close_conn},
+        {"close_ext", me.control_close_ext},
+        {"unknown", me.control_unknown},
+        {"malformed", me.control_malformed},
+    };
+    for (const auto& [kind, value] : control) {
+      if (value == 0) continue;
+      append_metric(out, "mtdd_me_control_frames",
+                    dc_label + ",type=\"" + kind + "\"", value);
+    }
+    if (me.rx_bytes_total != 0) {
+      append_metric(out, "mtdd_me_rx_bytes_total", dc_label,
+                    me.rx_bytes_total);
+    }
+    if (me.tx_bytes_total != 0) {
+      append_metric(out, "mtdd_me_tx_bytes_total", dc_label,
+                    me.tx_bytes_total);
+    }
+    append_metric(out, "mtdd_direct_active", dc_label, me.direct_active);
+    if (me.direct_accepted_total != 0) {
+      append_metric(out, "mtdd_direct_accepted_total", dc_label,
+                    me.direct_accepted_total);
+    }
+    if (me.direct_connect_fail_total != 0) {
+      append_metric(out, "mtdd_direct_connect_fail_total", dc_label,
+                    me.direct_connect_fail_total);
+    }
+    if (me.direct_rx_bytes_total != 0) {
+      append_metric(out, "mtdd_direct_rx_bytes_total", dc_label,
+                    me.direct_rx_bytes_total);
+    }
+    if (me.direct_tx_bytes_total != 0) {
+      append_metric(out, "mtdd_direct_tx_bytes_total", dc_label,
+                    me.direct_tx_bytes_total);
+    }
+    if (me.direct_budget_pauses_total != 0) {
+      append_metric(out, "mtdd_direct_budget_pauses_total", dc_label,
+                    me.direct_budget_pauses_total);
+    }
+  }
+  append_metric(out, "mtdd_me_pending_buffer_bytes", "",
+                snapshot.me_pending_buffer_bytes);
+  append_metric(out, "mtdd_buffer_budget_bytes", "",
+                snapshot.buffer_budget_used);
+  append_metric(out, "mtdd_handshakes_pending", "",
+                snapshot.handshakes_pending);
+  append_metric(out, "mtdd_client_pool_objects", "",
+                snapshot.client_pool_objects);
+  append_metric(out, "mtdd_client_allocations_total", "",
+                snapshot.client_allocations_total);
+  append_metric(out, "mtdd_client_reuses_total", "",
+                snapshot.client_reuses_total);
+  return out.str();
+}
+
+}  // namespace mtdd::control
