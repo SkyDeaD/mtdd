@@ -143,6 +143,17 @@ void append_metric(std::ostringstream& out, std::string_view name,
   out << ' ' << value << '\n';
 }
 
+uint64_t monotonic_ns() noexcept {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+std::string worker_label(std::size_t worker) {
+  return "worker=\"" + std::to_string(worker) + "\"";
+}
+
 }  // namespace
 
 const char* to_string(RejectReason reason) noexcept {
@@ -265,6 +276,24 @@ struct Statistics::Impl {
     std::atomic<uint64_t> direct_budget_pauses{0};
   };
 
+  // Per-reactor ME budget/read diagnostics. Deliberately NOT folded into
+  // MeSlot: MeSlot is aggregated across reactors by snapshot(), while these
+  // values must stay attributable to one worker.
+  struct MeWorkerGauges {
+    std::atomic<uint64_t> connections{0};
+    std::atomic<uint64_t> ready_connections{0};
+    std::atomic<uint64_t> read_armed_connections{0};
+    std::atomic<uint64_t> budget_paused_connections{0};
+    std::atomic<uint64_t> bound_clients_on_paused{0};
+    std::atomic<uint64_t> budget_pauses{0};
+    std::atomic<uint64_t> budget_resumes{0};
+    std::atomic<uint64_t> current_pause_age_ms{0};
+    std::atomic<uint64_t> max_pause_age_ms{0};
+    std::atomic<uint64_t> worst_writer_rtt_us{0};
+    std::atomic<uint64_t> slow_writers{0};
+    std::atomic<uint64_t> slow_evictions{0};
+  };
+
   // Gauges owned by one reactor. snapshot() sums them (boolean OR for
   // `connected`, max for the shared replay-cache size, min for the last-answer
   // age). ME request/answer outcome counters are reactor-sharded into the
@@ -277,11 +306,19 @@ struct Statistics::Impl {
     std::atomic<bool> ready{false};
     std::array<std::atomic<uint64_t>, kBufferStateCount> buffer_bytes;
     std::atomic<uint64_t> buffer_budget_used{0};
+    std::atomic<uint64_t> budget_limit_bytes{0};
+    std::atomic<uint64_t> active_clients{0};
     std::atomic<uint64_t> handshakes_pending{0};
     std::atomic<uint64_t> client_pool_objects{0};
     std::atomic<uint64_t> replay_cache{0};
     std::atomic<uint64_t> me_pending_bytes{0};
+    // Monotonic liveness. heartbeat_ns is a steady_clock epoch timestamp
+    // (0 = never published); snapshot() derives the age against its own clock.
+    std::atomic<uint64_t> heartbeat_ns{0};
+    std::atomic<uint64_t> housekeeping_lateness_ms{0};
+    std::atomic<uint64_t> housekeeping_lateness_max_ms{0};
     std::array<MeSlot, kMeSlotCount> me;  // zero-initialized by MeSlot defaults
+    std::array<MeWorkerGauges, kMeSlotCount> me_worker;
   };
 
   Impl(size_t max_tracked_users, std::chrono::steady_clock::time_point start)
@@ -531,6 +568,45 @@ void Statistics::set_replay_cache_entries(std::size_t worker,
       entries, std::memory_order_relaxed);
 }
 
+void Statistics::set_worker_diagnostics(std::size_t worker,
+                                        uint64_t budget_used_bytes,
+                                        uint64_t budget_limit_bytes,
+                                        uint64_t active_clients,
+                                        uint64_t handshakes_pending) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& gauges = impl_->gauges[worker % count];
+  gauges.buffer_budget_used.store(budget_used_bytes,
+                                  std::memory_order_relaxed);
+  gauges.budget_limit_bytes.store(budget_limit_bytes,
+                                  std::memory_order_relaxed);
+  gauges.active_clients.store(active_clients, std::memory_order_relaxed);
+  gauges.handshakes_pending.store(handshakes_pending,
+                                  std::memory_order_relaxed);
+}
+
+void Statistics::set_worker_heartbeat(std::size_t worker) noexcept {
+  set_worker_heartbeat_at(worker, monotonic_ns());
+}
+
+void Statistics::set_worker_heartbeat_at(std::size_t worker,
+                                         uint64_t monotonic_ns_value) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].heartbeat_ns.store(
+      monotonic_ns_value, std::memory_order_relaxed);
+}
+
+void Statistics::set_worker_housekeeping_lateness(std::size_t worker,
+                                                  uint64_t last_ms,
+                                                  uint64_t max_ms) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& gauges = impl_->gauges[worker % count];
+  gauges.housekeeping_lateness_ms.store(last_ms, std::memory_order_relaxed);
+  gauges.housekeeping_lateness_max_ms.store(max_ms, std::memory_order_relaxed);
+}
+
 void Statistics::api_request(ApiRoute route, ApiMethod method, int status) noexcept {
   impl_->api_total.fetch_add(1, std::memory_order_relaxed);
   impl_->api_cells[api_cell(route, method, status)].fetch_add(
@@ -704,6 +780,34 @@ void Statistics::me_pool(std::size_t worker, int dc, uint64_t connections,
   slot.pool_connections.store(connections, std::memory_order_relaxed);
   slot.pool_ready.store(ready, std::memory_order_relaxed);
 }
+void Statistics::me_worker(std::size_t worker, int dc,
+                           const MeWorkerSnapshot& values) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me_worker[me_slot(dc)];
+  slot.connections.store(values.connections, std::memory_order_relaxed);
+  slot.ready_connections.store(values.ready_connections,
+                               std::memory_order_relaxed);
+  slot.read_armed_connections.store(values.read_armed_connections,
+                                    std::memory_order_relaxed);
+  slot.budget_paused_connections.store(values.budget_paused_connections,
+                                       std::memory_order_relaxed);
+  slot.bound_clients_on_paused.store(values.bound_clients_on_paused,
+                                     std::memory_order_relaxed);
+  slot.budget_pauses.store(values.budget_pauses_total,
+                           std::memory_order_relaxed);
+  slot.budget_resumes.store(values.budget_resumes_total,
+                            std::memory_order_relaxed);
+  slot.current_pause_age_ms.store(values.current_pause_age_ms,
+                                  std::memory_order_relaxed);
+  slot.max_pause_age_ms.store(values.max_pause_age_ms,
+                              std::memory_order_relaxed);
+  slot.worst_writer_rtt_us.store(values.worst_writer_rtt_us,
+                                 std::memory_order_relaxed);
+  slot.slow_writers.store(values.slow_writers, std::memory_order_relaxed);
+  slot.slow_evictions.store(values.slow_evictions_total,
+                            std::memory_order_relaxed);
+}
 void Statistics::me_pool_scaling(std::size_t worker, int dc, uint64_t target,
                                  uint64_t clients, uint64_t up, uint64_t down,
                                  uint64_t failures) noexcept {
@@ -804,15 +908,19 @@ StatisticsSnapshot Statistics::snapshot() const {
   uint64_t client_pool_objects = 0;
   uint64_t replay_entries = 0;
   uint64_t me_pending_bytes = 0;
+  out.workers.resize(workers);
+  const uint64_t now_ns = monotonic_ns();
   for (std::size_t worker = 0; worker < workers; ++worker) {
     const auto& gauges = impl_->gauges[worker];
     for (size_t i = 0; i < kBufferStateCount; ++i) {
       out.buffer_bytes[i] += gauges.buffer_bytes[i].load(std::memory_order_relaxed);
     }
-    buffer_budget_used +=
+    const uint64_t worker_budget_used =
         gauges.buffer_budget_used.load(std::memory_order_relaxed);
-    handshakes_pending +=
+    buffer_budget_used += worker_budget_used;
+    const uint64_t worker_handshakes =
         gauges.handshakes_pending.load(std::memory_order_relaxed);
+    handshakes_pending += worker_handshakes;
     client_pool_objects +=
         gauges.client_pool_objects.load(std::memory_order_relaxed);
     // The replay cache is shared by every reactor, so all workers publish the
@@ -821,6 +929,54 @@ StatisticsSnapshot Statistics::snapshot() const {
         replay_entries, gauges.replay_cache.load(std::memory_order_relaxed));
     me_pending_bytes +=
         gauges.me_pending_bytes.load(std::memory_order_relaxed);
+
+    WorkerSnapshot& worker_out = out.workers[worker];
+    worker_out.budget_used_bytes = worker_budget_used;
+    worker_out.budget_limit_bytes =
+        gauges.budget_limit_bytes.load(std::memory_order_relaxed);
+    worker_out.active_clients =
+        gauges.active_clients.load(std::memory_order_relaxed);
+    worker_out.handshakes_pending = worker_handshakes;
+    const uint64_t heartbeat_ns =
+        gauges.heartbeat_ns.load(std::memory_order_relaxed);
+    if (heartbeat_ns != 0) {
+      worker_out.heartbeat_seen = true;
+      // Clamp a timestamp from the future to zero rather than underflowing.
+      worker_out.heartbeat_age_ms =
+          now_ns > heartbeat_ns ? (now_ns - heartbeat_ns) / 1'000'000 : 0;
+    }
+    worker_out.housekeeping_lateness_ms =
+        gauges.housekeeping_lateness_ms.load(std::memory_order_relaxed);
+    worker_out.housekeeping_lateness_max_ms =
+        gauges.housekeeping_lateness_max_ms.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kMeSlotCount; ++i) {
+      const auto& source = gauges.me_worker[i];
+      MeWorkerSnapshot& target = worker_out.me_dcs[kMeLabels[i]];
+      target.connections =
+          source.connections.load(std::memory_order_relaxed);
+      target.ready_connections =
+          source.ready_connections.load(std::memory_order_relaxed);
+      target.read_armed_connections =
+          source.read_armed_connections.load(std::memory_order_relaxed);
+      target.budget_paused_connections =
+          source.budget_paused_connections.load(std::memory_order_relaxed);
+      target.bound_clients_on_paused =
+          source.bound_clients_on_paused.load(std::memory_order_relaxed);
+      target.budget_pauses_total =
+          source.budget_pauses.load(std::memory_order_relaxed);
+      target.budget_resumes_total =
+          source.budget_resumes.load(std::memory_order_relaxed);
+      target.current_pause_age_ms =
+          source.current_pause_age_ms.load(std::memory_order_relaxed);
+      target.max_pause_age_ms =
+          source.max_pause_age_ms.load(std::memory_order_relaxed);
+      target.worst_writer_rtt_us =
+          source.worst_writer_rtt_us.load(std::memory_order_relaxed);
+      target.slow_writers =
+          source.slow_writers.load(std::memory_order_relaxed);
+      target.slow_evictions_total =
+          source.slow_evictions.load(std::memory_order_relaxed);
+    }
   }
   out.backpressure_c2s_total =
       impl_->backpressure_c2s.load(std::memory_order_relaxed);
@@ -1176,6 +1332,62 @@ std::string Statistics::prometheus_text() const {
     if (me.direct_budget_pauses_total != 0) {
       append_metric(out, "mtdd_direct_budget_pauses_total", dc_label,
                     me.direct_budget_pauses_total);
+    }
+  }
+  // Per-worker diagnostics. These are not alternatives to the summed gauges:
+  // the aggregate can hide one reactor at its local budget limit. Worker and DC
+  // labels are fixed; no addresses, client ids or payloads are exposed.
+  for (size_t w = 0; w < snapshot.workers.size(); ++w) {
+    const WorkerSnapshot& worker = snapshot.workers[w];
+    const std::string label = worker_label(w);
+    append_metric(out, "mtdd_worker_budget_used_bytes", label,
+                  worker.budget_used_bytes);
+    append_metric(out, "mtdd_worker_budget_limit_bytes", label,
+                  worker.budget_limit_bytes);
+    append_metric(out, "mtdd_worker_active_clients", label,
+                  worker.active_clients);
+    append_metric(out, "mtdd_worker_handshakes_pending", label,
+                  worker.handshakes_pending);
+    if (worker.heartbeat_seen) {
+      append_metric(out, "mtdd_worker_heartbeat_age_ms", label,
+                    worker.heartbeat_age_ms);
+    }
+    append_metric(out, "mtdd_worker_housekeeping_lateness_ms", label,
+                  worker.housekeeping_lateness_ms);
+    append_metric(out, "mtdd_worker_housekeeping_lateness_max_ms", label,
+                  worker.housekeeping_lateness_max_ms);
+    for (size_t i = 0; i < kMeSlotCount; ++i) {
+      const auto found = worker.me_dcs.find(kMeLabels[i]);
+      if (found == worker.me_dcs.end()) continue;
+      const MeWorkerSnapshot& me = found->second;
+      const std::string me_label =
+          label + ",dc=\"" + kMeLabels[i] + "\"";
+      append_metric(out, "mtdd_worker_me_connections", me_label,
+                    me.connections);
+      append_metric(out, "mtdd_worker_me_ready", me_label,
+                    me.ready_connections);
+      // Actual epoll read interest of this reactor's ME sockets, not a
+      // derived expectation: a paused read is absent from the mask.
+      append_metric(out, "mtdd_worker_me_read_armed", me_label,
+                    me.read_armed_connections);
+      append_metric(out, "mtdd_worker_me_budget_paused", me_label,
+                    me.budget_paused_connections);
+      append_metric(out, "mtdd_worker_me_paused_bound_clients", me_label,
+                    me.bound_clients_on_paused);
+      append_metric(out, "mtdd_worker_me_budget_pauses_total", me_label,
+                    me.budget_pauses_total);
+      append_metric(out, "mtdd_worker_me_budget_resumes_total", me_label,
+                    me.budget_resumes_total);
+      append_metric(out, "mtdd_worker_me_pause_current_ms", me_label,
+                    me.current_pause_age_ms);
+      append_metric(out, "mtdd_worker_me_pause_max_ms", me_label,
+                    me.max_pause_age_ms);
+      append_metric(out, "mtdd_worker_me_worst_writer_rtt_us", me_label,
+                    me.worst_writer_rtt_us);
+      append_metric(out, "mtdd_worker_me_slow_writers", me_label,
+                    me.slow_writers);
+      append_metric(out, "mtdd_worker_me_slow_evictions_total", me_label,
+                    me.slow_evictions_total);
     }
   }
   append_metric(out, "mtdd_me_pending_buffer_bytes", "",

@@ -403,6 +403,71 @@ TEST(MeAudit, IncompleteMeFrameMustRespectGlobalBufferBudget) {
     test.reactor->remove_target(me.token);
 }
 
+TEST(MeAudit, MeBudgetPauseAndResumeAreVisiblePerWorker) {
+    AuditReactor test("me-budget-diag");
+    auto ready = make_ready();
+    auto owned = std::make_unique<mtdd::Runtime::Impl::MeConn>();
+    auto& me = *owned;
+    me.dc = 2;
+    me.state = mtdd::Runtime::Impl::MeConn::State::ready;
+    me.session = std::move(ready.session);
+    me.token = test.reactor->add_target({mtdd::Runtime::Impl::Kind::me, &me});
+    int sockets[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sockets), 0);
+    me.fd.reset(sockets[0]);
+    mtdd::io::UniqueFd peer(sockets[1]);
+    me.clients = 3;
+    auto& pool = test.reactor->me_pool_[2];
+    pool.desired_generation = 1;
+    pool.serving_generation = 1;
+    pool.scale_target = 1;
+    pool.conns.push_back(std::move(owned));
+
+    const auto paused_at = mtdd::Runtime::Impl::Clock::now();
+    // The local partition is exhausted: read_me must pause instead of failing
+    // the shared session, and the transition is counted once.
+    test.reactor->budget_used_ = test.config.global_buffer_bytes;
+    test.reactor->read_me(me, paused_at);
+    EXPECT_TRUE(me.budget_paused);
+    EXPECT_EQ(me.budget_pauses, 1u);
+    EXPECT_EQ(me.armed & EPOLLIN, 0u)
+        << "a paused ME read must leave the epoll read mask";
+    test.reactor->publish_me_worker_diagnostics(2, paused_at + std::chrono::milliseconds{250});
+    auto snapshot = test.stats.snapshot();
+    ASSERT_EQ(snapshot.workers.size(), 1u);
+    const auto& paused = snapshot.workers[0].me_dcs.at("2");
+    EXPECT_EQ(paused.budget_paused_connections, 1u);
+    EXPECT_EQ(paused.bound_clients_on_paused, 3u)
+        << "the blast radius is every client multiplexed on the paused ME";
+    EXPECT_EQ(paused.read_armed_connections, 0u);
+    EXPECT_EQ(paused.current_pause_age_ms, 250u);
+    EXPECT_GE(paused.max_pause_age_ms, 250u);
+    EXPECT_EQ(paused.budget_pauses_total, 1u);
+    EXPECT_EQ(paused.budget_resumes_total, 0u);
+
+    // Slack returns: the same housekeeping path resumes and re-arms the read,
+    // and the completed pause duration is retained.
+    test.reactor->budget_used_ = 0;
+    test.reactor->unpause_clients_if_possible(paused_at + std::chrono::milliseconds{250});
+    EXPECT_FALSE(me.budget_paused);
+    EXPECT_EQ(me.budget_resumes, 1u);
+    EXPECT_GE(me.budget_pause_max_ms, 250u);
+    EXPECT_NE(me.armed & EPOLLIN, 0u) << "resume did not re-arm the read";
+    test.reactor->publish_me_worker_diagnostics(2, paused_at + std::chrono::milliseconds{300});
+    snapshot = test.stats.snapshot();
+    const auto& resumed = snapshot.workers[0].me_dcs.at("2");
+    EXPECT_EQ(resumed.budget_paused_connections, 0u);
+    EXPECT_EQ(resumed.bound_clients_on_paused, 0u);
+    EXPECT_EQ(resumed.read_armed_connections, 1u);
+    EXPECT_EQ(resumed.current_pause_age_ms, 0u);
+    EXPECT_GE(resumed.max_pause_age_ms, 250u);
+    EXPECT_EQ(resumed.budget_pauses_total, 1u);
+    EXPECT_EQ(resumed.budget_resumes_total, 1u);
+
+    test.reactor->remove_target(me.token);
+    test.reactor->me_pool_.clear();
+}
+
 // ---------------------------------------------------------------------------
 // Keepalive liveness is traffic-based, not PONG-based.
 // ---------------------------------------------------------------------------

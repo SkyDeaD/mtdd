@@ -232,9 +232,9 @@ void Runtime::Impl::setup() {
     shared_->register_wake(wake_.get());
 
     const int backlog = config_.max_connections == 0
-                            ? 1024
+                            ? 4096
                             : static_cast<int>(
-                                  std::min<std::uint32_t>(config_.max_connections, 1024));
+                                  std::min<std::uint32_t>(config_.max_connections, 4096));
     auto listener = io::listen_tcp(config_.proxy_host, config_.proxy_port, backlog, reuse_port_);
     if (!listener.ok()) {
         errno = listener.error;
@@ -297,6 +297,13 @@ void Runtime::Impl::run() {
         recompute_ready();
         next_poll_ = now + detail::kPollInterval;
         next_gauge_ = now + std::chrono::seconds(1);
+        // Publish one initial worker sample so a reactor that stalls before its
+        // first 1 Hz tick still has a heartbeat that snapshot() can age out.
+        stats_.set_worker_diagnostics(worker_index_, budget_used_,
+                                      config_.global_buffer_bytes,
+                                      clients_.size(), handshake_count_);
+        stats_.set_worker_heartbeat(worker_index_);
+        stats_.set_worker_housekeeping_lateness(worker_index_, 0, 0);
 
         std::array<epoll_event, detail::kEpollBatch> events{};
         while (true) {
@@ -308,6 +315,21 @@ void Runtime::Impl::run() {
                 if (now >= shutdown_deadline_) break;
             }
             if (now >= next_poll_) {
+                // Record how late the fixed 150 ms housekeeping tick actually
+                // ran. A late tick with a fresh heartbeat separates event-loop
+                // blocking from budget gating; a stale heartbeat separates a
+                // stopped reactor.
+                const auto late = now > next_poll_
+                                      ? std::chrono::duration_cast<
+                                            std::chrono::milliseconds>(
+                                            now - next_poll_)
+                                            .count()
+                                      : 0;
+                housekeeping_lateness_ms_ =
+                    static_cast<std::uint64_t>(late > 0 ? late : 0);
+                housekeeping_lateness_max_ms_ =
+                    std::max(housekeeping_lateness_max_ms_,
+                             housekeeping_lateness_ms_);
                 poll_users(now);
                 poll_metadata(now);
                 housekeeping(now);
@@ -320,7 +342,7 @@ void Runtime::Impl::run() {
             }
             if (now >= next_gauge_) {
                 reaccount_shared();
-                unpause_clients_if_possible();
+                unpause_clients_if_possible(now);
                 // Buffer/replay gauges are refreshed at 1 Hz, not per packet.
                 stats_.set_replay_cache_entries(worker_index_, shared_->replay.size());
                 std::uint64_t queued = 0;
@@ -366,6 +388,9 @@ void Runtime::Impl::run() {
                     // Pool gauges, readiness and keepalive are reactor-owned
                     // per-DC aggregates (see publish_me_pool).
                     publish_me_pool(dc);
+                    // The same 1 Hz pool traversal also publishes the
+                    // per-worker budget/read diagnostics; no extra client scan.
+                    publish_me_worker_diagnostics(dc, now);
                     // Publishes the age of the newest answer of a live member,
                     // or an explicit "no answer" when no live member has one.
                     publish_me_answer_age(dc, now);
@@ -400,6 +425,16 @@ void Runtime::Impl::run() {
                 stats_.me_pending_buffer_bytes(worker_index_, me_pending);
                 stats_.set_buffer_budget_used(worker_index_, budget_used_);
                 stats_.set_handshakes_pending(worker_index_, handshake_count_);
+                // Per-worker truth: the summed budget gauge above can hide one
+                // reactor at its local partition limit. The heartbeat is a
+                // monotonic stamp; snapshot() derives its age independently.
+                stats_.set_worker_diagnostics(
+                    worker_index_, budget_used_, config_.global_buffer_bytes,
+                    clients_.size(), handshake_count_);
+                stats_.set_worker_heartbeat(worker_index_);
+                stats_.set_worker_housekeeping_lateness(
+                    worker_index_, housekeeping_lateness_ms_,
+                    housekeeping_lateness_max_ms_);
                 const auto& lifecycle = detail::client_lifecycle_telemetry();
                 stats_.set_client_pool(
                     worker_index_, free_clients_.size(),

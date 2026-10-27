@@ -50,6 +50,7 @@ using mtdd::control::HandshakeResult;
 using mtdd::control::HttpOptions;
 using mtdd::control::MeResult;
 using mtdd::control::MeAnswerResult;
+using mtdd::control::MeWorkerSnapshot;
 using mtdd::control::MutationOutcome;
 using mtdd::control::RejectReason;
 using mtdd::control::RotateSecretRequest;

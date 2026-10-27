@@ -230,6 +230,18 @@ void Runtime::Impl::on_me_ping_deadline(MeConn& me, Time now) {
         return;
     }
     if (me.unanswered_pings >= std::max<std::size_t>(ping_tuning_.max_unanswered, 1)) {
+        if (me.budget_paused) {
+            // Inbound silence is self-inflicted: EPOLLIN is disarmed by the
+            // buffer budget, so the peer's PONG could not have been read. Failing
+            // the shared session here would drop every client bound to it for a
+            // local resource shortage. Restart the window; it is judged again
+            // once reads resume.
+            me.unanswered_pings = 0;
+            me.pending_pings.clear();
+            me.ping_window_rx = me.rx_bytes;
+            schedule_me_ping(me, now);
+            return;
+        }
         if (me.rx_bytes != me.ping_window_rx) {
             // The peer kept sending inbound traffic during the whole window:
             // it is alive even though it ignored or delayed PONG. A missing
@@ -309,6 +321,7 @@ void Runtime::Impl::handle_me_pong(MeConn& me, std::int64_t ping_id, Time now) {
     }
     if (!matched) return;
     me.unanswered_pings = 0;
+    me.rtt_last_us = static_cast<std::uint64_t>(sample_us < 0.0 ? 0.0 : sample_us);
     if (!me.rtt_valid) {
         me.rtt_valid = true;
         me.rtt_ema_us = sample_us;
@@ -325,6 +338,7 @@ void Runtime::Impl::handle_me_pong(MeConn& me, std::int64_t ping_id, Time now) {
 void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
                                     std::span<const std::uint8_t> payload, Time now) {
     ++me.ans_received;
+    me.unanswered_since = Time{};
     me.last_answer_at = now;
     me.answer_seen = true;
     stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::received);
@@ -417,6 +431,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
 
 void Runtime::Impl::deliver_quick_ack(MeConn& me, const detail::ConnId& id,
                                       std::array<std::uint8_t, 4> confirm, Time now) {
+    me.unanswered_since = Time{};
     (void)now;
     if (!me.session || !me.session->ready()) return;
     const auto found = clients_by_conn_.find(id);

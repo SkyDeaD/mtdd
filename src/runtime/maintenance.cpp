@@ -40,6 +40,7 @@ void Runtime::Impl::housekeeping(Time now) {
             }
         }
     }
+    if (!stopping_) evict_slow_me_writers(now);
     // Retire draining connections at zero clients or at their hard deadline.
     reap_me_pool(now);
     // Safety net: a ready queue with remaining work is resumed every 150 ms
@@ -55,7 +56,7 @@ void Runtime::Impl::housekeeping(Time now) {
     finish_eof_clients(now, true);
     finish_direct_eof(now);
     finish_fallback_pairs(now);
-    unpause_clients_if_possible();
+    unpause_clients_if_possible(now);
     reaccount_shared();
     // The process-wide connection count can drop because another reactor closed
     // a client; re-evaluate this reactor's listener so a reactor that paused
@@ -121,11 +122,7 @@ void Runtime::Impl::forget_accounting(std::size_t accounted) {
     budget_used_ = accounted > budget_used_ ? 0 : budget_used_ - accounted;
 }
 
-void Runtime::Impl::unpause_clients_if_possible() {
-    if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
-        reaccount_shared();
-        return;
-    }
+void Runtime::Impl::unpause_clients_if_possible(Time now) {
     // A paused ME read reserves one full read batch plus headroom, matching the
     // admission check in read_me(); a weaker threshold would only re-pause.
     if (budget_allows(detail::kReadBatch + detail::kBudgetHeadroom / 2)) {
@@ -134,10 +131,28 @@ void Runtime::Impl::unpause_clients_if_possible() {
             for (auto& me : pool.conns) {
                 if (me && me->budget_paused) {
                     me->budget_paused = false;
+                    ++me->budget_resumes;
+                    if (me->budget_paused_at != Time{}) {
+                        const auto age = now > me->budget_paused_at
+                                             ? std::chrono::duration_cast<
+                                                   std::chrono::milliseconds>(
+                                                   now - me->budget_paused_at)
+                                                   .count()
+                                             : 0;
+                        me->budget_pause_max_ms =
+                            std::max(me->budget_pause_max_ms,
+                                     static_cast<std::uint64_t>(age > 0 ? age : 0));
+                    }
                     update_me_interest(*me);
                 }
             }
         }
+    }
+    // Clients resume only with more free budget than an ME read needs, so the
+    // shared writer is always re-armed first and never starved by its clients.
+    if (!budget_allows(detail::kClientReadReservation)) {
+        reaccount_shared();
+        return;
     }
     const bool direct_can_resume = budget_allows(detail::kDirectReadReservation);
     std::vector<std::uint64_t> remaining;
@@ -319,6 +334,7 @@ void Runtime::Impl::finalize() {
         // pool for its slot before the connections are destroyed.
         stats_.me_connected(worker_index_, dc, false);
         stats_.me_pool(worker_index_, dc, 0, 0);
+        stats_.me_worker(worker_index_, dc, control::MeWorkerSnapshot{});
     }
     me_by_token_.clear();
     me_pool_.clear();
@@ -329,6 +345,8 @@ void Runtime::Impl::finalize() {
     stats_.me_pending_buffer_bytes(worker_index_, 0);
     stats_.set_buffer_budget_used(worker_index_, 0);
     stats_.set_handshakes_pending(worker_index_, 0);
+    stats_.set_worker_diagnostics(worker_index_, 0,
+                                  config_.global_buffer_bytes, 0, 0);
     stats_.set_replay_cache_entries(worker_index_, 0);
     const auto& lifecycle = detail::client_lifecycle_telemetry();
     stats_.set_client_pool(worker_index_, 0,

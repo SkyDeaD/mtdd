@@ -340,6 +340,51 @@ struct MeDcSnapshot {
   uint64_t direct_budget_pauses_total{0};
 };
 
+// Per-reactor ME budget/read diagnostics. Unlike MeDcSnapshot these values are
+// NOT summed across reactors: one locally exhausted worker must stay visible
+// even when another worker has budget slack. Labels stay bounded (13 DC slots).
+struct MeWorkerSnapshot {
+  uint64_t connections{0};
+  uint64_t ready_connections{0};
+  // Established ME sockets whose current epoll interest mask contains EPOLLIN.
+  uint64_t read_armed_connections{0};
+  // ME reads refused by this reactor's budget (EPOLLIN removed while paused).
+  uint64_t budget_paused_connections{0};
+  // Clients multiplexed on those paused ME sockets: the user-visible blast
+  // radius of a worker-local pause.
+  uint64_t bound_clients_on_paused{0};
+  uint64_t budget_pauses_total{0};
+  uint64_t budget_resumes_total{0};
+  // Oldest currently paused read, and the largest pause observed (including a
+  // still-running one). Milliseconds because housekeeping retries every 150 ms.
+  uint64_t current_pause_age_ms{0};
+  uint64_t max_pause_age_ms{0};
+  // Worst-writer view. The DC RTT gauge is a mean, so one head-of-line blocked
+  // writer disappears into it; these expose it directly.
+  // Largest of: newest PONG sample, age of the oldest unanswered ping.
+  uint64_t worst_writer_rtt_us{0};
+  // Ready writers currently flagged slow, and writers retired for it.
+  uint64_t slow_writers{0};
+  uint64_t slow_evictions_total{0};
+};
+
+// Fixed per-worker diagnostics. `heartbeat_age_ms` is computed by snapshot()
+// from a monotonic timestamp the reactor publishes, so a stalled worker cannot
+// appear current just because the control thread read an old value.
+struct WorkerSnapshot {
+  uint64_t budget_used_bytes{0};
+  uint64_t budget_limit_bytes{0};
+  uint64_t active_clients{0};
+  uint64_t handshakes_pending{0};
+  bool heartbeat_seen{false};
+  uint64_t heartbeat_age_ms{0};
+  // Lateness of the reactor's 150 ms housekeeping tick vs. its scheduled
+  // deadline: last observed and maximum since startup.
+  uint64_t housekeeping_lateness_ms{0};
+  uint64_t housekeeping_lateness_max_ms{0};
+  std::map<std::string, MeWorkerSnapshot> me_dcs;  // bounded signed DC labels
+};
+
 struct StatisticsSnapshot {
   std::string build_version;
   uint64_t uptime_seconds{0};
@@ -363,6 +408,9 @@ struct StatisticsSnapshot {
   uint64_t api_requests_total{0};
   uint64_t me_pending_buffer_bytes{0};
   std::map<std::string, MeDcSnapshot> me_dcs;  // bounded signed DC labels
+  // Indexed by worker. The aggregate fields above keep their historical summed
+  // meaning; this vector exposes the local values an aggregate hides.
+  std::vector<WorkerSnapshot> workers;
   IpHistorySnapshot unique_ip_history;
   uint64_t ip_history_observation_failures{0};
 };
@@ -452,6 +500,23 @@ class Statistics {
   void set_replay_cache_entries(uint64_t entries) noexcept;
   void set_replay_cache_entries(std::size_t worker, uint64_t entries) noexcept;
 
+  // Per-reactor diagnostics. These are deliberately separate from the summed
+  // buffer_budget_used/handshake gauges above: an aggregate can look healthy
+  // while one reactor is at its local budget limit. `budget_limit_bytes` is
+  // that reactor's partition, not the process-wide setting.
+  void set_worker_diagnostics(std::size_t worker, uint64_t budget_used_bytes,
+                              uint64_t budget_limit_bytes,
+                              uint64_t active_clients,
+                              uint64_t handshakes_pending) noexcept;
+  // Stamps the reactor's liveness with the current monotonic clock. snapshot()
+  // derives the age, so the value cannot go stale simply by being re-read.
+  void set_worker_heartbeat(std::size_t worker) noexcept;
+  // Test seam / explicit timestamp form of the same monotonic nanosecond value.
+  void set_worker_heartbeat_at(std::size_t worker, uint64_t monotonic_ns) noexcept;
+  // Housekeeping lateness vs. the scheduled 150 ms deadline (milliseconds).
+  void set_worker_housekeeping_lateness(std::size_t worker, uint64_t last_ms,
+                                        uint64_t max_ms) noexcept;
+
   void api_request(ApiRoute route, ApiMethod method, int status) noexcept;
 
   // ME connectivity is reported per bounded signed DC label:
@@ -512,6 +577,10 @@ class Statistics {
   void me_pool(int dc, uint64_t connections, uint64_t ready) noexcept;
   void me_pool(std::size_t worker, int dc, uint64_t connections,
                uint64_t ready) noexcept;
+  // One reactor's ME budget/read diagnostics for one signed DC. Same fixed
+  // label set and `values` shape as MeWorkerSnapshot; never summed with peers.
+  void me_worker(std::size_t worker, int dc,
+                 const MeWorkerSnapshot& values) noexcept;
   void me_pool_scaling(std::size_t worker, int dc, uint64_t target,
                        uint64_t clients, uint64_t up, uint64_t down,
                        uint64_t failures) noexcept;

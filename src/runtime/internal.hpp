@@ -178,6 +178,14 @@ inline constexpr std::size_t kBudgetHeadroom = 128U * 1024U;
 // overshoot the reservation by 4x.
 inline constexpr std::size_t kDirectReadReservation = kReadBatch + kBudgetHeadroom / 2;
 
+// Client and fallback socket reads must stop admitting data strictly before an
+// ME read does. The ME session is shared by every client bound to it: if it is
+// paused for budget while clients keep filling the remaining headroom, the
+// writer stops receiving, its keepalive window sees no inbound bytes and the
+// whole pool member (with all its clients) is failed.
+inline constexpr std::size_t kClientReadReservation =
+    kReadBatch + kBudgetHeadroom / 2 + 8U * 1024U;
+
 // Test/benchmark-only override for the Direct Telegram DC endpoint. Production
 // startup never installs one, so the compiled official address table is used
 // unchanged. This exists so local integration tests and the loopback benchmark
@@ -266,6 +274,16 @@ struct MePingTuning {
     std::chrono::milliseconds interval{25000};
     std::chrono::milliseconds jitter{5000};
     std::size_t max_unanswered{3};
+    // Slow-writer containment. A ready writer whose newest PONG sample, or whose
+    // oldest unanswered ping, is at least `slow_rtt` is "slow". One that stays
+    // slow for `slow_evict_after` is retired from new-client admission and given
+    // `slow_drain` for its bound clients, while the pool dials a replacement.
+    // The shared stream is head-of-line blocked, so every client on such a
+    // writer suffers together; averaging it into a DC gauge only hid it.
+    std::chrono::milliseconds slow_rtt{3000};
+    std::chrono::milliseconds slow_evict_after{60000};
+    std::chrono::milliseconds slow_drain{20000};
+    std::chrono::milliseconds slow_evict_gap{10000};
 };
 void set_me_ping_tuning_for_test(std::optional<MePingTuning> value);
 MePingTuning me_ping_tuning();
@@ -629,6 +647,15 @@ struct Runtime::Impl {
         // socket data; unpause_clients_if_possible() re-arms it. Unlike a
         // client budget pause this never fails the shared ME session.
         bool budget_paused{false};
+        // Worker-diagnostic counters for that pause. `budget_pauses` increments
+        // once per false->true transition (not per refused read), `budget_resumes`
+        // once when housekeeping clears it. `budget_paused_at` is the monotonic
+        // start; `budget_pause_max_ms` retains the longest completed/ongoing
+        // pause until the connection is folded into its DC base.
+        std::uint64_t budget_pauses{0};
+        std::uint64_t budget_resumes{0};
+        Time budget_paused_at{};
+        std::uint64_t budget_pause_max_ms{0};
         // Keepalive state. ping_token is a separate deadline token because
         // Deadlines allows exactly one deadline per token, and the ME token is
         // already used for handshake/retry/ready-wake scheduling.
@@ -642,6 +669,16 @@ struct Runtime::Impl {
         std::uint64_t ping_window_rx{0};
         bool rtt_valid{false};
         double rtt_ema_us{0};
+        // Newest raw PONG sample (not smoothed): the EMA reacts too slowly to
+        // tell a fresh stall from an old one.
+        std::uint64_t rtt_last_us{0};
+        // First moment the writer was observed slow, Time{} while healthy.
+        Time slow_since{};
+        // First client request forwarded since the last answer (payload or
+        // quick-ack) came back; Time{} once anything is answered. A missing PONG
+        // alone does not mean clients are stalled (some ME hosts never PONG
+        // while relaying fine), so retirement also requires this to be old.
+        Time unanswered_since{};
         // Pool bookkeeping: live clients bound to this exact ME connection.
         // A connection failure closes only these clients; conn ids are
         // protocol-bound and cannot migrate to another ME socket.
@@ -668,6 +705,10 @@ struct Runtime::Impl {
         std::uint64_t scale_up_total{0};
         std::uint64_t scale_down_total{0};
         std::uint64_t creation_failures_total{0};
+        // Writers retired for sustained slow PONGs, and the earliest time the
+        // next one may be retired (spreads replacement over several ticks).
+        std::uint64_t slow_evictions_total{0};
+        Time next_slow_evict{};
         // Inbound control counters accumulated from connections that were
         // already replaced or failed. Keeps mtdd_me_control_frames monotone per
         // DC across replacements.
@@ -675,6 +716,12 @@ struct Runtime::Impl {
         std::uint64_t control_close_ext{0};
         std::uint64_t control_unknown{0};
         std::uint64_t control_malformed{0};
+        // Worker ME budget-pause totals folded from connections that already
+        // left the pool. Published value is base + Σ live members, so the
+        // counters stay monotone across replacements (same rule as bytes).
+        std::uint64_t budget_pauses{0};
+        std::uint64_t budget_resumes{0};
+        std::uint64_t budget_pause_max_ms{0};
         // Socket bytes folded from connections that were already replaced or
         // failed. Published value is base + Σ live members, so
         // mtdd_me_{rx,tx}_bytes_total never moves backwards when the pool
@@ -736,7 +783,7 @@ struct Runtime::Impl {
     void reaccount_shared();
     void forget_accounting(std::size_t accounted);
     std::size_t shared_bytes() const noexcept;
-    void unpause_clients_if_possible();
+    void unpause_clients_if_possible(Time now);
 
     // ------------------------------------------------------------------
     // Users / metadata / readiness
@@ -846,6 +893,7 @@ struct Runtime::Impl {
     // failed connection keeps its slot (and its byte mirror) across retries.
     void fold_me_counters(MeConn& me) noexcept;
     void reap_me_pool(Time now);
+    void evict_slow_me_writers(Time now);
     void scale_me_pool(std::int16_t dc, Time now);
     void retire_me(MeConn& me);
     // Successor-first metadata replacement: build the new generation, keep the
@@ -875,6 +923,9 @@ struct Runtime::Impl {
     void enqueue_ready(Client& client);
     void arm_me_ready_wake(MeConn& me, Time now);
     void publish_me_queue(MeConn& me);
+    // One-reactor, one-DC budget/read diagnostics for the 1 Hz gauge tick.
+    // Bounded traversal of the existing pool; never called per packet.
+    void publish_me_worker_diagnostics(std::int16_t dc, Time now) noexcept;
     void deliver_payload(MeConn& me, const detail::ConnId& id,
                          std::span<const std::uint8_t> payload, Time now);
     void deliver_quick_ack(MeConn& me, const detail::ConnId& id,
@@ -970,6 +1021,10 @@ struct Runtime::Impl {
 
     Time next_poll_{};
     Time next_gauge_{};
+    // Housekeeping lateness vs. the scheduled next_poll_ deadline. Sampled on
+    // the existing 150 ms tick; published with the 1 Hz worker diagnostics.
+    std::uint64_t housekeeping_lateness_ms_{0};
+    std::uint64_t housekeeping_lateness_max_ms_{0};
     // Sweep cadence and the earliest FIN/read-EOF expiry. The latter is also
     // published to wait_timeout_ms so the reactor wakes for a deadline even
     // without traffic.

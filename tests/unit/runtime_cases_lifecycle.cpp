@@ -161,6 +161,131 @@ TEST(Runtime, MePingTimeoutReplacesOnlyTheDeadConnection) {
     }, 5s)) << "the failed slot did not reconnect via backoff";
 }
 
+namespace {
+
+mtdd::control::MeWorkerSnapshot me_worker_dc(const mtdd::control::Statistics& stats,
+                                             std::string_view label) {
+    mtdd::control::MeWorkerSnapshot total;
+    for (const auto& worker : stats.snapshot().workers) {
+        const auto found = worker.me_dcs.find(std::string(label));
+        if (found == worker.me_dcs.end()) continue;
+        total.worst_writer_rtt_us =
+            std::max(total.worst_writer_rtt_us, found->second.worst_writer_rtt_us);
+        total.slow_writers += found->second.slow_writers;
+        total.slow_evictions_total += found->second.slow_evictions_total;
+    }
+    return total;
+}
+
+} // namespace
+
+// A writer that stays alive by traffic but never answers PING is head-of-line
+// blocked. It must be visible as the worst writer, retired from admission after
+// the slow window, and its clients released, while a healthy sibling keeps the
+// DC usable.
+TEST(Runtime, MeSlowWriterIsSurfacedAndRetiredWhileSiblingKeepsServing) {
+    mtdd::detail::set_me_ping_tuning_for_test(mtdd::detail::MePingTuning{
+        std::chrono::milliseconds{250}, std::chrono::milliseconds{0}, 1000,
+        std::chrono::milliseconds{400}, std::chrono::milliseconds{900},
+        std::chrono::milliseconds{800}, std::chrono::milliseconds{300}});
+    struct Reset {
+        ~Reset() { mtdd::detail::set_me_ping_tuning_for_test(std::nullopt); }
+    } reset;
+    PoolMe::Options options;
+    options.ignore_pings_on_first = true;
+    options.inbound_chatter = true;
+    options.answer_clients = false;
+    PoolMe me(me_secret(), options);
+    Daemon daemon(me.port(), true, [](mtdd::Config& config) {
+        config.me_connections_per_dc = 2;
+        config.me_clients_per_writer = 1;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    TestClient first(daemon.port(), secret_bytes());
+    TestClient second(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(first.send_hello());
+    ASSERT_TRUE(first.start_obfuscation(2));
+    ASSERT_TRUE(second.send_hello(0, 1));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    // The fake ME never answers client requests here, so the requests stay
+    // unanswered; only the PONG-answering sibling is healthy.
+    ASSERT_TRUE(first.send_message(Bytes{0x11, 1, 2, 3, 4, 5, 6, 7}));
+    ASSERT_TRUE(second.send_message(Bytes{0x22, 1, 2, 3, 4, 5, 6, 7}));
+    ASSERT_TRUE(wait_for([&] {
+        return me_dc(daemon.services.stats, "2").ready_connections == 2;
+    }, 12s)) << "the pool did not scale to two ready connections";
+
+    ASSERT_TRUE(wait_for([&] {
+        return me_worker_dc(daemon.services.stats, "2").worst_writer_rtt_us >= 400000;
+    }, 6s)) << "a writer ignoring PING was not surfaced as the worst writer";
+    ASSERT_TRUE(wait_for([&] {
+        return me_worker_dc(daemon.services.stats, "2").slow_evictions_total >= 1;
+    }, 10s)) << "a persistently slow writer was not retired";
+    EXPECT_EQ(me_dc(daemon.services.stats, "2").ping_timeouts_total, 0U)
+        << "traffic proves liveness, so this must be eviction, not a ping timeout";
+    EXPECT_TRUE(wait_closed(first.fd(), 6000))
+        << "clients bound to the retired writer must be released";
+    ASSERT_TRUE(wait_for([&] {
+        return me_dc(daemon.services.stats, "2").ready_connections >= 1;
+    }, 5s));
+    TestClient replacement(daemon.port(), secret_bytes());
+    ASSERT_TRUE(replacement.valid());
+    ASSERT_TRUE(replacement.send_hello(0, 2));
+    ASSERT_TRUE(replacement.start_obfuscation(2));
+    EXPECT_TRUE(replacement.send_message(Bytes{0x33, 1, 2, 3, 4, 5, 6, 7}))
+        << "the DC must keep admitting clients through the healthy sibling";
+}
+
+// The opposite case: a writer that never PONGs but keeps answering client
+// requests is relaying fine. It is surfaced in the metrics but must not be
+// retired, otherwise live clients would be cut for no user-visible gain.
+TEST(Runtime, MeWriterWithoutPongButAnsweringClientsIsNotRetired) {
+    mtdd::detail::set_me_ping_tuning_for_test(mtdd::detail::MePingTuning{
+        std::chrono::milliseconds{250}, std::chrono::milliseconds{0}, 1000,
+        std::chrono::milliseconds{400}, std::chrono::milliseconds{900},
+        std::chrono::milliseconds{800}, std::chrono::milliseconds{300}});
+    struct Reset {
+        ~Reset() { mtdd::detail::set_me_ping_tuning_for_test(std::nullopt); }
+    } reset;
+    PoolMe::Options options;
+    options.ignore_pings_on_first = true;
+    options.inbound_chatter = true;
+    PoolMe me(me_secret(), options);
+    Daemon daemon(me.port(), true, [](mtdd::Config& config) {
+        config.me_connections_per_dc = 2;
+        config.me_clients_per_writer = 1;
+    });
+    ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
+    ASSERT_TRUE(wait_for([&] { return daemon.services.metadata->snapshot() != nullptr; }, 3s));
+    TestClient first(daemon.port(), secret_bytes());
+    TestClient second(daemon.port(), secret_bytes());
+    ASSERT_TRUE(first.valid());
+    ASSERT_TRUE(second.valid());
+    ASSERT_TRUE(first.send_hello());
+    ASSERT_TRUE(first.start_obfuscation(2));
+    ASSERT_TRUE(second.send_hello(0, 1));
+    ASSERT_TRUE(second.start_obfuscation(2));
+    ASSERT_TRUE(exchange(first, 0x11));
+    ASSERT_TRUE(exchange(second, 0x22));
+    ASSERT_TRUE(wait_for([&] {
+        return me_dc(daemon.services.stats, "2").ready_connections == 2;
+    }, 12s));
+    const auto until = std::chrono::steady_clock::now() + 4s;
+    std::uint8_t marker = 0x40;
+    while (std::chrono::steady_clock::now() < until) {
+        ASSERT_TRUE(exchange(first, marker++));
+        ASSERT_TRUE(exchange(second, marker++));
+        std::this_thread::sleep_for(100ms);
+    }
+    EXPECT_GE(me_worker_dc(daemon.services.stats, "2").worst_writer_rtt_us, 400000U)
+        << "the PONG-less writer must still be visible";
+    EXPECT_EQ(me_worker_dc(daemon.services.stats, "2").slow_evictions_total, 0U);
+    EXPECT_FALSE(wait_closed(first.fd(), 200));
+}
+
 TEST(Runtime, MePoolDistributesClientsAndFailureClosesOnlyItsClients) {
     PoolMe me(me_secret());
     Daemon daemon(me.port(), true, [](mtdd::Config& config) {

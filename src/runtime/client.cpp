@@ -307,7 +307,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
-    if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
+    if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
         paused_clients_.push_back(client.token);
         stats_.add_backpressure(control::Direction::client_to_server);

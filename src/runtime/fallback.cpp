@@ -224,7 +224,7 @@ void Runtime::Impl::on_fallback_connected(Client& client, Time now) {
 void Runtime::Impl::read_fallback_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
     if (!client.c2b) return;
-    if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
+    if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
         paused_clients_.push_back(client.token);
         stats_.add_backpressure(control::Direction::client_to_server);
@@ -273,7 +273,7 @@ void Runtime::Impl::read_fallback_client(Client& client, Time now) {
 void Runtime::Impl::read_fallback_backend(Client& client, Time now) {
     if (client.backend_connecting || client.backend_eof) return;
     if (!client.out) return;
-    if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
+    if (!budget_allows(detail::kClientReadReservation)) {
         if (!client.backend_budget_paused) {
             client.backend_budget_paused = true;
             paused_clients_.push_back(client.token);
