@@ -399,11 +399,11 @@ sudo bash install.sh     # то же меню через сам установщ
 | `allow_remote_control` | `true` разрешает API вне loopback; по умолчанию `false` — включение допустимо только в защищённой сети или через туннель |
 | `workers` | Число reactors; `0` выбирает доступное число ядер с учётом бюджета памяти |
 | `max_connections`, `max_handshakes` | Не заданы по умолчанию (без лимита); положительное значение включает общий предел подключений или одновременных рукопожатий. Память всё равно ограничивается `global_buffer_bytes` |
-| `global_buffer_bytes` | Бюджет буферов пересылки, делится между workers. Без установщика по умолчанию 64 МиБ; установщик записывает четверть RAM (от 64 МиБ до 1 ГиБ), если параметр не задан |
+| `global_buffer_bytes` | Бюджет буферов пересылки, делится между workers. По умолчанию 256 МиБ; установщик записывает четверть RAM (от 64 МиБ до 1 ГиБ), если параметр не задан |
 | `connection_queue_bytes`, `max_frame_bytes` | Размер очереди и предел собираемого кадра |
 | `handshake_timeout_seconds`, `idle_timeout_seconds` | Тайм-аут рукопожатия и простоя соединения |
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
-| `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 12; установщик записывает 16, если параметр не задан |
+| `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 16 |
 | `me_clients_per_writer` | Целевой порог клиентов для роста пула, по умолчанию 400 |
 | `metadata_refresh_seconds` | Интервал обновления метаданных |
 | `direct_fallback_enabled`, `direct_fallback_dcs` | Явно включаемый Direct fallback для перечисленных signed DC |
