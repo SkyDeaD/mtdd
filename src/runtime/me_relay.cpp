@@ -327,16 +327,16 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     ++me.ans_received;
     me.last_answer_at = now;
     me.answer_seen = true;
-    stats_.me_answer(me.dc, control::MeAnswerResult::received);
+    stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::received);
     if (!me.session || !me.session->ready()) {
         ++me.ans_dropped_other;
-        stats_.me_answer(me.dc, control::MeAnswerResult::dropped_other);
+        stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::dropped_other);
         return;
     }
     const auto found = clients_by_conn_.find(id);
     if (found == clients_by_conn_.end()) {
         ++me.ans_dropped_unknown;
-        stats_.me_answer(me.dc, control::MeAnswerResult::dropped_unknown);
+        stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::dropped_unknown);
         // The conn id is unknown to this proxy, so the remote mapping is
         // orphaned: release it with a bounded RPC_CLOSE_CONN (queued, flushed
         // after the decoder callback returns).
@@ -346,7 +346,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     const auto client_found = clients_.find(found->second);
     if (client_found == clients_.end()) {
         ++me.ans_dropped_unknown;
-        stats_.me_answer(me.dc, control::MeAnswerResult::dropped_unknown);
+        stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::dropped_unknown);
         queue_remote_close(me, id);
         return;
     }
@@ -356,7 +356,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
         // A live id owned by another writer (or already closing locally) must
         // never be closed through this ME connection.
         ++me.ans_dropped_other;
-        stats_.me_answer(me.dc, control::MeAnswerResult::dropped_other);
+        stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::dropped_other);
         return;
     }
 
@@ -410,7 +410,7 @@ void Runtime::Impl::deliver_payload(MeConn& me, const detail::ConnId& id,
     client.metrics->add_payload(control::Direction::server_to_client, payload.size());
     client.awaiting_reply = false;
     ++me.ans_delivered;
-    stats_.me_answer(me.dc, control::MeAnswerResult::delivered);
+    stats_.me_answer(worker_index_, me.dc, control::MeAnswerResult::delivered);
     detail::trim_scratch(wire_buffer_);
     reaccount_shared();
 }

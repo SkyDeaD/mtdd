@@ -17,5 +17,12 @@ __pycache__/
 /.private/
 /specs
 
+# Local performance research, reports, plans and benchmark harnesses.
+/docs/performance/
+/docs/MTDD_IMPROVEMENT_PLAN.md
+/tools/bench_deadlines.cpp
+/tools/bench_me_counters.cpp
+/tools/bench_transport_decode.cpp
+
 # Local load-test tooling contains deployment-specific targets and run scripts.
 /tools/loadgen/

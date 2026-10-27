@@ -200,7 +200,7 @@ void Runtime::Impl::pump_c2s(Client& client, Time now) {
             return;
         }
         me.frame_bytes += me.frames.back().bytes.size();
-        stats_.me_request(me.dc, control::MeResult::success);
+        stats_.me_request(worker_index_, me.dc, control::MeResult::success);
         client.awaiting_reply = true;
         client.last_forward_at = now;
         client.c2s_capacity -= message.data.capacity();

@@ -267,9 +267,12 @@ struct Statistics::Impl {
 
   // Gauges owned by one reactor. snapshot() sums them (boolean OR for
   // `connected`, max for the shared replay-cache size, min for the last-answer
-  // age). Process-lifetime ME counters have no owning reactor and are
-  // accumulated in slot 0 with atomics; the snapshot still walks every slot, so
-  // each increment is counted exactly once.
+  // age). ME request/answer outcome counters are reactor-sharded into the
+  // writer's fixed slot (worker % kMaxWorkers); the remaining process-lifetime
+  // ME counters have no owning reactor and are accumulated in slot 0 with
+  // atomics. snapshot() sums the sharded fields over the monotonic
+  // high-water bound of ever-addressable/touched slots, so each increment is
+  // counted exactly once without a fixed 256-slot sweep.
   struct WorkerGauges {
     std::atomic<bool> ready{false};
     std::array<std::atomic<uint64_t>, kBufferStateCount> buffer_bytes;
@@ -292,8 +295,40 @@ struct Statistics::Impl {
     for (auto& cell : api_cells) cell.store(0);
   }
 
+  // Covers `slot` (an index, not a count) for later snapshot sweeps. The
+  // caller has already published its relaxed increment; the release RMW below
+  // orders that increment before the raised bound becomes visible to a
+  // snapshot that acquire-loads it. Already-covered slots do not RMW.
+  void publish_slot(size_t slot) noexcept {
+    raise_high_water(slot + 1);
+  }
+
+  void raise_high_water(size_t required) noexcept {
+    required = std::min(required, kMaxWorkers);
+    size_t bound = shard_high_water.slots.load(std::memory_order_relaxed);
+    while (required > bound &&
+           !shard_high_water.slots.compare_exchange_weak(
+               bound, required, std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
+  }
+
   std::chrono::steady_clock::time_point started_at;
   std::atomic<size_t> worker_count{1};
+  // Monotonic high-water bound (1..kMaxWorkers) of fixed counter slots that a
+  // writer may have used: raised by configure_workers() and lazily by the
+  // sharded ME counter overloads on first use of their slot. It never shrinks,
+  // so shrinking the worker count cannot hide cumulative history. Only writers
+  // on a not-yet-covered slot perform a RMW; the steady-state hot path is one
+  // relaxed load that stays read-mostly. The release publication of a raised
+  // bound pairs with the acquire load in snapshot(): a slot increment that
+  // happened before the raise is visible to readers that observe the new bound.
+  // alignas(64) keeps the shared hot read off the line of gauges[0], which is
+  // written per packet by worker 0.
+  struct alignas(64) ShardHighWater {
+    std::atomic<size_t> slots{1};  // slot 0 always exists (legacy API)
+  };
+  ShardHighWater shard_high_water{};
   std::array<WorkerGauges, kMaxWorkers> gauges;
   mutable std::mutex build_mutex;
   std::string build_version;
@@ -332,6 +367,9 @@ void Statistics::configure_workers(std::size_t workers) noexcept {
     workers = Statistics::Impl::kMaxWorkers;
   }
   impl_->worker_count.store(workers, std::memory_order_relaxed);
+  // Addressable worker slots are part of the cumulative sweep bound even
+  // before their first write; the bound never shrinks on reconfiguration.
+  impl_->raise_high_water(workers);
 }
 
 void Statistics::set_ready(bool ready) noexcept {
@@ -513,14 +551,25 @@ void Statistics::me_connected(std::size_t worker, int dc,
   slot.connected.store(connected, std::memory_order_relaxed);
 }
 void Statistics::me_reconnect(int dc) noexcept {
-  // Process-lifetime ME counters are not owned by a reactor, so every reactor
-  // accumulates them in slot 0. snapshot() sums slots exactly once, and the
-  // increments are atomic, so N reactors cannot multiply a total.
+  // The reconnect counter is not reactor-owned, so every reactor accumulates it
+  // in slot 0. snapshot() sums slots exactly once, and the increments are
+  // atomic, so N reactors cannot multiply a total. Request/answer outcomes are
+  // sharded separately by worker (see me_request/me_answer below).
   impl_->gauges[0].me[me_slot(dc)].reconnects.fetch_add(
       1, std::memory_order_relaxed);
 }
 void Statistics::me_request(int dc, MeResult result) noexcept {
-  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  me_request(0, dc, result);
+}
+void Statistics::me_request(std::size_t worker, int dc,
+                            MeResult result) noexcept {
+  // Route by the fixed statistics capacity, not by the configured worker
+  // count: a worker id that was valid before a reconfiguration must keep its
+  // slot. The slot is published to the monotonic high-water bound after the
+  // increment, so snapshot() can stop at the highest slot ever touched and the
+  // steady state costs one relaxed load instead of a per-packet RMW.
+  const std::size_t shard = worker % Impl::kMaxWorkers;
+  auto& slot = impl_->gauges[shard].me[me_slot(dc)];
   switch (result) {
     case MeResult::success:
       slot.requests_success.fetch_add(1, std::memory_order_relaxed);
@@ -532,9 +581,15 @@ void Statistics::me_request(int dc, MeResult result) noexcept {
       slot.requests_timeout.fetch_add(1, std::memory_order_relaxed);
       break;
   }
+  impl_->publish_slot(shard);
 }
 void Statistics::me_answer(int dc, MeAnswerResult result) noexcept {
-  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  me_answer(0, dc, result);
+}
+void Statistics::me_answer(std::size_t worker, int dc,
+                           MeAnswerResult result) noexcept {
+  const std::size_t shard = worker % Impl::kMaxWorkers;
+  auto& slot = impl_->gauges[shard].me[me_slot(dc)];
   switch (result) {
     case MeAnswerResult::received:
       slot.ans_received.fetch_add(1, std::memory_order_relaxed);
@@ -549,6 +604,7 @@ void Statistics::me_answer(int dc, MeAnswerResult result) noexcept {
       slot.ans_dropped_other.fetch_add(1, std::memory_order_relaxed);
       break;
   }
+  impl_->publish_slot(shard);
 }
 void Statistics::me_control(int dc, uint64_t close_conn, uint64_t close_ext,
                             uint64_t unknown, uint64_t malformed) noexcept {
@@ -708,6 +764,14 @@ StatisticsSnapshot Statistics::snapshot() const {
   out.ready = ready();
   const std::size_t workers =
       impl_->worker_count.load(std::memory_order_relaxed);
+  // Cumulative request/answer shards are swept once per snapshot up to the
+  // monotonic high-water bound of touched/addressable slots, not the full
+  // fixed capacity. The single acquire load pairs with the release raises in
+  // publish_slot()/configure_workers(), so slots covered by the observed bound
+  // are visible to the relaxed loads below.
+  const std::size_t cumulative_slots = std::min(
+      impl_->shard_high_water.slots.load(std::memory_order_acquire),
+      Impl::kMaxWorkers);
   out.connections_accepted_total =
       impl_->accepted.load(std::memory_order_relaxed);
   out.connections_active = impl_->active.load(std::memory_order_relaxed);
@@ -816,12 +880,6 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.ping_stall.load(std::memory_order_relaxed);
       entry.reconnects_total +=
           slot.reconnects.load(std::memory_order_relaxed);
-      entry.requests_success +=
-          slot.requests_success.load(std::memory_order_relaxed);
-      entry.requests_failure +=
-          slot.requests_failure.load(std::memory_order_relaxed);
-      entry.requests_timeout +=
-          slot.requests_timeout.load(std::memory_order_relaxed);
       entry.ready_queue_depth +=
           slot.ready_depth.load(std::memory_order_relaxed);
       entry.ready_queue_clients +=
@@ -830,14 +888,6 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.frames_bytes.load(std::memory_order_relaxed);
       entry.out_queued_bytes +=
           slot.out_bytes.load(std::memory_order_relaxed);
-      entry.proxy_ans_received_total +=
-          slot.ans_received.load(std::memory_order_relaxed);
-      entry.proxy_ans_delivered_total +=
-          slot.ans_delivered.load(std::memory_order_relaxed);
-      entry.proxy_ans_dropped_unknown_total +=
-          slot.ans_dropped_unknown.load(std::memory_order_relaxed);
-      entry.proxy_ans_dropped_other_total +=
-          slot.ans_dropped_other.load(std::memory_order_relaxed);
       if (slot.ans_seen.load(std::memory_order_relaxed)) {
         const uint64_t age =
             slot.last_ans_age.load(std::memory_order_relaxed);
@@ -868,6 +918,29 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.direct_tx.load(std::memory_order_relaxed);
       entry.direct_budget_pauses_total +=
           slot.direct_budget_pauses.load(std::memory_order_relaxed);
+    }
+    // Request/answer outcomes are cumulative and were written into the
+    // reactor's fixed slot (worker % 256). They are not gauges of the current
+    // worker set, so sweep up to the monotonic high-water bound: shrinking the
+    // worker count must not hide history, while untouched high slots cost
+    // nothing. Summing outside the active loop keeps the totals independent of
+    // reconfiguration.
+    for (std::size_t worker = 0; worker < cumulative_slots; ++worker) {
+      const auto& cumulative = impl_->gauges[worker].me[i];
+      entry.requests_success +=
+          cumulative.requests_success.load(std::memory_order_relaxed);
+      entry.requests_failure +=
+          cumulative.requests_failure.load(std::memory_order_relaxed);
+      entry.requests_timeout +=
+          cumulative.requests_timeout.load(std::memory_order_relaxed);
+      entry.proxy_ans_received_total +=
+          cumulative.ans_received.load(std::memory_order_relaxed);
+      entry.proxy_ans_delivered_total +=
+          cumulative.ans_delivered.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_unknown_total +=
+          cumulative.ans_dropped_unknown.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_other_total +=
+          cumulative.ans_dropped_other.load(std::memory_order_relaxed);
     }
     entry.ping_rtt_us = rtt_samples == 0 ? 0 : rtt_sum / rtt_samples;
     entry.proxy_ans_seen = answer_seen;

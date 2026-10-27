@@ -406,7 +406,9 @@ class Statistics {
 
   // Startup-only, before worker threads or the control server run. Worker
   // gauges are summed (or OR-ed/min-ed where a sum is meaningless) in snapshot;
-  // single-argument gauge setters below target worker 0 for compatibility.
+  // the non-worker gauge setters below target worker 0 for compatibility.
+  // Also monotonically raises the cumulative-slot high-water bound; shrinking
+  // the count never lowers it.
   void configure_workers(std::size_t workers) noexcept;
 
   void set_ready(bool ready) noexcept;
@@ -458,9 +460,18 @@ class Statistics {
   void me_connected(std::size_t worker, int dc, bool connected) noexcept;
   void me_reconnect(int dc) noexcept;
   void me_request(int dc, MeResult result) noexcept;
+  // Per-reactor variants: the cumulative request counter is accumulated in the
+  // reactor's fixed statistics slot (worker % 256) so independent reactors do
+  // not contend for one cache line. The legacy two-argument forms above keep
+  // writing slot 0 for compatibility. snapshot() sums every slot up to a
+  // monotonic high-water bound of ever-touched/addressable slots (never shrunk
+  // by configure_workers), so the totals are exact regardless of how many
+  // workers are currently active and untouched capacity is not scanned.
+  void me_request(std::size_t worker, int dc, MeResult result) noexcept;
   // Cumulative answer outcome for one signed DC. Called once per received
   // RPC_PROXY_ANS, never per payload byte.
   void me_answer(int dc, MeAnswerResult result) noexcept;
+  void me_answer(std::size_t worker, int dc, MeAnswerResult result) noexcept;
   // Inbound control-constructor counts for one signed DC. Absolute values
   // (gauges) accumulated by the reactor across replacements: a replaced
   // connection folds its counters into the DC base, so the series never moves

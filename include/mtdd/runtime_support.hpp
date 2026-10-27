@@ -118,6 +118,9 @@ public:
     }
 
     std::vector<std::uint64_t> due(Time now, std::size_t limit = 256) {
+        // Hot path after every epoll batch: the earliest timer is usually still
+        // in the future, so return before touching the allocator.
+        if (limit == 0 || ordered_.empty() || ordered_.begin()->first > now) return {};
         std::vector<std::uint64_t> result;
         result.reserve(std::min(limit, ordered_.size()));
         while (!ordered_.empty() && ordered_.begin()->first <= now && result.size() < limit) {

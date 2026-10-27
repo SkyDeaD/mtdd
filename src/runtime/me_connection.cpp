@@ -56,7 +56,7 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
         if (const auto found = me_pool_.find(me.dc); found != me_pool_.end()) {
             ++found->second.creation_failures_total;
         }
-        stats_.me_request(me.dc, control::MeResult::failure);
+        stats_.me_request(worker_index_, me.dc, control::MeResult::failure);
         ++me.candidate;
         // Refreshes the per-reactor pool gauge and the connected flag in one
         // place (publish_me_pool owns the readiness transition).
@@ -338,7 +338,7 @@ void Runtime::Impl::read_me(MeConn& me, Time now) {
                 return;
             }
             if (status == protocol::Status::ProtocolError || status == protocol::Status::Closed) {
-                stats_.me_request(me.dc, control::MeResult::failure);
+                stats_.me_request(worker_index_, me.dc, control::MeResult::failure);
                 fail_me(me, now);
                 return;
             }

@@ -669,7 +669,7 @@ void Runtime::Impl::process_deadlines(Time now) {
                     if (!stopping_ && !me.draining) connect_me(me, now);
                 } else if (me.state == MeConn::State::connecting ||
                            me.state == MeConn::State::handshaking) {
-                    stats_.me_request(me.dc, control::MeResult::timeout);
+                    stats_.me_request(worker_index_, me.dc, control::MeResult::timeout);
                     fail_me(me, now);
                 } else if (me.state == MeConn::State::ready) {
                     // Bounded self-wake for a ready queue that still has work
