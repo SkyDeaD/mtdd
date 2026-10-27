@@ -98,13 +98,13 @@ TEST(Config, WorkerCountAutoByDefaultAndExplicitlyBounded) {
 
 TEST(Config, MeConnectionsPerDcIsBounded) {
     EXPECT_EQ(mtdd::Config::parse(minimal_config(), "/work").me_connections_per_dc, 12U);
-    for (const auto connections : {1U, 4U, 8U, 12U}) {
+    for (const auto connections : {1U, 4U, 8U, 12U, 13U, 24U}) {
         auto value = minimal_config();
         value["me_connections_per_dc"] = connections;
         EXPECT_EQ(mtdd::Config::parse(value, "/work").me_connections_per_dc,
                   connections);
     }
-    for (const auto invalid : {0, 13, -1}) {
+    for (const auto invalid : {0, 25, -1}) {
         auto value = minimal_config();
         value["me_connections_per_dc"] = invalid;
         EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);

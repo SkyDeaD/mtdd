@@ -390,18 +390,18 @@ TEST(Runtime, SharedMiddleEndSurvivesOneLogicalClientClose) {
 
 TEST(Runtime, MeWriterLimitsAcceptConfiguredMaximum) {
     Services services(1, false, [](mtdd::Config& config) {
-        config.me_connections_per_dc = 12;
+        config.me_connections_per_dc = 24;
         config.me_clients_per_writer = 400;
     });
     EXPECT_NO_THROW({
         mtdd::Runtime runtime(services.config, *services.store, services.stats,
                               *services.metadata, services.barrier);
     });
-    // 2 * 12 = 24 pool slots per DC stay below the reactor's 63-writer cap.
+    // 2 * 24 = 48 pool slots per DC stay below the reactor's 63-writer cap.
     EXPECT_LE(2U * services.config.me_connections_per_dc, 63U);
 
     Services invalid(1, false, [](mtdd::Config& config) {
-        config.me_connections_per_dc = 13;
+        config.me_connections_per_dc = 25;
     });
     EXPECT_THROW(
         {

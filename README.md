@@ -394,7 +394,7 @@ sudo bash install.sh     # то же меню через сам установщ
 | `connection_queue_bytes`, `max_frame_bytes` | Размер очереди и предел собираемого кадра |
 | `handshake_timeout_seconds`, `idle_timeout_seconds` | Тайм-аут рукопожатия и простоя соединения |
 | `shutdown_timeout_seconds` | Предел на плавное завершение реактора |
-| `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–12, по умолчанию 12 |
+| `me_connections_per_dc` | Максимум активных ME writers на signed DC и reactor, 1–24, по умолчанию 12 |
 | `me_clients_per_writer` | Целевой порог клиентов для роста пула, по умолчанию 400 |
 | `metadata_refresh_seconds` | Интервал обновления метаданных |
 | `direct_fallback_enabled`, `direct_fallback_dcs` | Явно включаемый Direct fallback для перечисленных signed DC |
