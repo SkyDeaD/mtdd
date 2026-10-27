@@ -200,6 +200,7 @@ build_openssl() {
     build_id=$(openssl_build_id)
     if [[ -f $PREFIX/lib/libssl.a && -f $PREFIX/lib/libcrypto.a ]] \
         && [[ -f $PREFIX/.openssl-build-id ]] \
+        && [[ -f $PREFIX/.openssl-configdata.pm ]] \
         && [[ $(<"$PREFIX/.openssl-build-id") == "$build_id" ]]; then
         return
     fi
@@ -227,6 +228,11 @@ build_openssl() {
         make install_sw >"$LOGS/openssl-install.log" 2>&1
     )
     [[ -f $PREFIX/lib/libssl.a && -f $PREFIX/lib/libcrypto.a ]] || die "OpenSSL static libraries were not installed"
+    # The lock gate needs the Configure record of the library that was linked.
+    # Keep it in the prefix: CI prunes src/ before saving the cache, so a later
+    # run that reuses the cached prefix re-extracts a clean source tree with no
+    # configdata.pm and could not verify anything.
+    cp "$SRC/openssl-$OPENSSL_VERSION/configdata.pm" "$PREFIX/.openssl-configdata.pm"
     printf '%s\n' "$build_id" >"$PREFIX/.openssl-build-id"
     printf '%s\n' "$OPENSSL_VERSION" >"$PREFIX/.openssl-version"
 }
@@ -417,7 +423,7 @@ grep -aF -- '/etc/ssl/certs/ca-certificates.crt' "$BIN" >/dev/null \
 # and crashes concurrent handshakes. Verify the linked code, not just inputs.
 log "verifying OpenSSL thread locks in the linked binary"
 bash "$REPO_ROOT/tools/verify-static-locks.sh" \
-    "$BIN" "$SRC/openssl-$OPENSSL_VERSION/configdata.pm" | tee "$OUT/lock-gate.txt"
+    "$BIN" "$PREFIX/.openssl-configdata.pm" | tee "$OUT/lock-gate.txt"
 
 mkdir -p "$(dirname "$COPY")"
 cp "$BIN" "$OUT/mtdd"
