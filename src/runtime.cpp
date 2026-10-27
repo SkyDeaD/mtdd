@@ -298,7 +298,7 @@ void Runtime::Impl::run() {
         next_poll_ = now + detail::kPollInterval;
         next_gauge_ = now + std::chrono::seconds(1);
 
-        std::array<epoll_event, 64> events{};
+        std::array<epoll_event, detail::kEpollBatch> events{};
         while (true) {
             now = Clock::now();
             if (exit_requested() && !stopping_) begin_shutdown(now);

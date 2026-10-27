@@ -2,6 +2,16 @@
 
 namespace {
 
+// The reactor batches readiness and accepts in fixed, stack-safe arrays. The
+// sizes are part of the overload contract: too small starves a busy reactor,
+// while an unbounded batch would let one event monopolise the worker.
+TEST(Runtime, EpollAndAcceptBatchesStayBoundedAndLargeEnough) {
+    EXPECT_EQ(mtdd::detail::kEpollBatch, 512U);
+    EXPECT_LE(sizeof(std::array<epoll_event, mtdd::detail::kEpollBatch>),
+              std::size_t{64} * 1024U);
+    EXPECT_EQ(mtdd::detail::kAcceptBatch, 128U);
+}
+
 TEST(Runtime, BindsAndStops) {
     Daemon daemon(1, false);
     ASSERT_NE(daemon.port(), 0);

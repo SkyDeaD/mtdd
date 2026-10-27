@@ -42,6 +42,14 @@ namespace detail {
 // still bounded, which keeps one event from monopolising the worker.
 inline constexpr std::size_t kReadBatch = 32U * 1024U;
 inline constexpr std::size_t kWriteBatch = 64U * 1024U;
+// Fixed epoll wait batch. A 64-entry array forced a busy reactor back into
+// epoll_wait for every 64 ready descriptors, which starved new handshakes under
+// DC2 load. 512 amortises the syscall while keeping the array on the worker
+// stack (a few KiB per reactor, independent of the connection count).
+inline constexpr std::size_t kEpollBatch = 512;
+// Sockets accepted per listener readiness event. Bounded so a connection burst
+// cannot monopolise one reactor; the listen backlog holds the remainder.
+inline constexpr std::size_t kAcceptBatch = 128;
 // Masking-target DNS cache lifetime; probes are rare, so a blocking resolve
 // on the reactor at TTL expiry is an acceptable trade-off (documented).
 inline constexpr std::chrono::seconds kFallbackResolveTtl{300};

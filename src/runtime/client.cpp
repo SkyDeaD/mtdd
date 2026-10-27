@@ -130,7 +130,7 @@ void Runtime::Impl::release_client_pool() noexcept {
 }
 
 void Runtime::Impl::accept_clients(Time now) {
-    for (int iteration = 0; iteration < 32; ++iteration) {
+    for (std::size_t iteration = 0; iteration < detail::kAcceptBatch; ++iteration) {
         if (config_.max_connections != 0 &&
             (clients_.size() >= static_cast<std::size_t>(config_.max_connections) ||
              shared_->connections.load(std::memory_order_relaxed) >=
