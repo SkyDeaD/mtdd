@@ -157,7 +157,7 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     }
     config.workers = static_cast<std::uint32_t>(number(value, "workers", 0, 0, 256));
     config.me_connections_per_dc = static_cast<std::uint32_t>(
-        number(value, "me_connections_per_dc", config.me_connections_per_dc, 1, 8));
+        number(value, "me_connections_per_dc", config.me_connections_per_dc, 1, 12));
     config.me_clients_per_writer = static_cast<std::uint32_t>(
         number(value, "me_clients_per_writer", config.me_clients_per_writer, 1, 1000000));
     if (value.contains("max_connections")) {

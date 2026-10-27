@@ -32,9 +32,9 @@ struct Config {
     std::uint32_t workers{0};
     // Zero means unlimited; set a positive value to enforce a global cap.
     std::uint32_t max_connections{0};
-    // Maximum active ME connections per signed DC and reactor, range 1..8.
-    std::uint32_t me_connections_per_dc{2};
-    std::uint32_t me_clients_per_writer{1000};
+    // Maximum active ME connections per signed DC and reactor, range 1..12.
+    std::uint32_t me_connections_per_dc{12};
+    std::uint32_t me_clients_per_writer{400};
     // Zero means unlimited; set a positive value to cap pending handshakes.
     std::uint32_t max_handshakes{0};
     std::size_t max_frame_bytes{2 * 1024 * 1024};

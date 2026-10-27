@@ -177,8 +177,8 @@ Runtime::Impl::Impl(const Config& config, control::UserStore& users,
     if (config_.handshake_timeout.count() <= 0 || config_.shutdown_timeout.count() <= 0) {
         throw std::invalid_argument("runtime timeouts must be positive");
     }
-    if (config_.me_connections_per_dc < 1 || config_.me_connections_per_dc > 8) {
-        throw std::invalid_argument("me_connections_per_dc must be in 1..8");
+    if (config_.me_connections_per_dc < 1 || config_.me_connections_per_dc > 12) {
+        throw std::invalid_argument("me_connections_per_dc must be in 1..12");
     }
     if (config_.me_clients_per_writer == 0 || config_.me_clients_per_writer > 1000000) {
         throw std::invalid_argument("me_clients_per_writer must be in 1..1000000");
