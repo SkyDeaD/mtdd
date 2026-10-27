@@ -123,7 +123,10 @@ FdResult listen_tcp(std::string_view address, std::uint16_t port, int backlog,
         result.error = errno;
         return result;
     }
-    if (::listen(fd, std::clamp(backlog, 1, SOMAXCONN)) != 0) {
+    // SOMAXCONN is a userspace (glibc) constant, not the kernel limit; Linux
+    // silently caps the effective backlog at net.core.somaxconn. Clamp only to
+    // the kernel's int range so a requested 1024 backlog is not cut to 128 here.
+    if (::listen(fd, std::clamp(backlog, 1, 65535)) != 0) {
         result.error = errno;
         return result;
     }

@@ -137,6 +137,11 @@ void Runtime::Impl::accept_clients(Time now) {
                  config_.max_connections)) {
             break;
         }
+        // Do not accept a socket that make_client() would immediately reject
+        // for lack of budget. Accept-then-close churn under a rejection storm
+        // creates orphan sockets; leaving the connection in the listen backlog
+        // is bounded by the listener backlog.
+        if (!budget_allows(detail::kBudgetHeadroom + 8192)) break;
         sockaddr_storage address{};
         socklen_t length = sizeof(address);
         const int fd = ::accept4(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length,

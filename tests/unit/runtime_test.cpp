@@ -88,19 +88,23 @@ TEST(Runtime, ZeroConnectionAndHandshakeLimitsAreUnlimited) {
     ::close(second);
 }
 
-TEST(Runtime, GlobalBufferAdmissionLimitRejectsNewClients) {
+TEST(Runtime, GlobalBufferAdmissionLimitPausesListenerWithoutAccepting) {
     Daemon daemon(1, false, [](mtdd::Config& config) {
         config.connection_queue_bytes = 4096;
         config.max_frame_bytes = 4096;
+        // Below make_client()'s admission reservation (headroom + 8 KiB), so the
+        // reactor must never accept: accepting and closing would strand an
+        // orphan socket per attempt.
         config.global_buffer_bytes = 100U * 1024U;
     });
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
     const int fd = connect_loopback(daemon.port());
     ASSERT_GE(fd, 0);
-    EXPECT_TRUE(wait_closed(fd, 3000));
-    EXPECT_TRUE(wait_for(
-        [&] { return stat_counter(daemon.services.stats, "rejected", "overload") >= 1U; }, 2s));
+    // The kernel completes the handshake into the listen backlog, but the
+    // listener stays paused: no FIN, no overload rejection, no active client.
+    EXPECT_FALSE(wait_closed(fd, 500));
     EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 0U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "overload"), 0U);
     ::close(fd);
 }
 

@@ -350,11 +350,10 @@ TEST(Runtime, InboundMeControlCountersReachStatistics) {
 
 // End-to-end regression for the live overload signature. With a bounded global
 // buffer budget, a burst of authenticated sessions fills the budget; once they
-// are idle, their retained capacity must be returned, otherwise every later
-// client is refused at accept with reason="overload" even though no payload is
-// pending. Before the idle trim this test admits zero sessions in the second
-// burst. The burst length is discovered by the test itself, so the assertion
-// does not depend on machine speed.
+// are idle, their retained capacity must be returned, otherwise the listener
+// stays paused and every later client is refused admission even though no
+// payload is pending. The burst length is discovered by the test itself, so the
+// assertion does not depend on machine speed.
 TEST(Runtime, IdleConnectionBuffersAreTrimmedSoAdmissionStaysOpen) {
     FakeMe me{me_secret()};
     Daemon daemon(me.port(), true, [](mtdd::Config& c) {
@@ -377,27 +376,43 @@ TEST(Runtime, IdleConnectionBuffersAreTrimmedSoAdmissionStaysOpen) {
         if (!client->send_hello(0, static_cast<std::uint8_t>(variant))) return nullptr;
         return client;
     };
+    auto active = [&] { return daemon.services.stats.snapshot().connections_active; };
 
-    // Fill until admission closes. Each authenticated session retains an
-    // output block, so a handful of them exhaust this small budget.
+    // Open a burst of authenticated sessions. Their retained capacity must be
+    // returned once they go idle; otherwise the bounded budget never returns to
+    // a level that lets the listener admit new clients.
     std::vector<ClientPtr> sessions;
-    int accepted = 0;
     for (int i = 0; i < 24; ++i) {
         auto client = handshake(i);
         if (!client) break;
         sessions.push_back(std::move(client));
-        ++accepted;
     }
+    // The buffered gauge is published at 1 Hz. Sample across the handshake
+    // window so the peak retained capacity is observed before the idle trim.
+    std::uint64_t used_peak = 0;
+    for (int i = 0; i < 40; ++i) {
+        used_peak = std::max(used_peak, daemon.services.stats.snapshot().buffer_budget_used);
+        std::this_thread::sleep_for(50ms);
+    }
+    const int accepted = static_cast<int>(active());
     EXPECT_GE(accepted, 3) << "the bounded budget admitted too few sessions";
-    const std::uint64_t overload_before =
-        stat_counter(daemon.services.stats, "rejected", "overload");
-    EXPECT_GT(overload_before, 0U) << "test requires the budget to bind first";
+    EXPECT_GT(used_peak, 0U) << "the buffered gauge never observed retained capacity";
+    // If the burst overran the budget the listener paused and the surplus
+    // sockets are still queued in the backlog. Drop them so a listener that
+    // resumes after the idle trim cannot turn them into sessions.
+    sessions.resize(static_cast<std::size_t>(std::max(accepted, 0)));
+    std::this_thread::sleep_for(100ms);
+    const std::uint64_t active_before_idle = active();
 
     // Idle window: the release runs on the 1 Hz gauge tick, so wait for the
     // 1 s idle threshold plus one full tick period.
     std::this_thread::sleep_for(2500ms);
+    const std::uint64_t used_after = daemon.services.stats.snapshot().buffer_budget_used;
+    EXPECT_LT(used_after, used_peak) << "idle sessions kept their retained capacity";
+    EXPECT_EQ(active(), active_before_idle) << "idle trim closed an idle session";
 
-    // Admission reopens without any traffic from the idle sessions.
+    // Admission still works after the trim without any traffic from the idle
+    // sessions.
     int admitted_after = 0;
     for (int i = 0; i < 3; ++i) {
         auto client = handshake(40 + i);
@@ -405,12 +420,10 @@ TEST(Runtime, IdleConnectionBuffersAreTrimmedSoAdmissionStaysOpen) {
         sessions.push_back(std::move(client));
         ++admitted_after;
     }
-    EXPECT_EQ(admitted_after, 3)
-        << "new sessions were still refused after idle capacity was released";
-
-    // Releasing capacity must not have closed or corrupted the idle sessions.
-    EXPECT_EQ(daemon.services.stats.snapshot().connections_active,
-              static_cast<std::uint64_t>(accepted + admitted_after));
+    EXPECT_EQ(admitted_after, 3);
+    EXPECT_TRUE(wait_for(
+        [&] { return active() == active_before_idle + static_cast<std::uint64_t>(admitted_after); },
+        2s)) << "new sessions were still refused after idle capacity was released";
 }
 
 // Deterministic accounting regression: every close path must release exactly

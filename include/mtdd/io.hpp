@@ -193,7 +193,8 @@ struct FdResult {
 
 /// Creates a non-blocking, close-on-exec TCP listener bound to a numeric
 /// address. Enables SO_REUSEADDR and optionally SO_REUSEPORT. @p backlog is
-/// clamped to [1, SOMAXCONN]. Port 0 asks the kernel for an ephemeral port.
+/// clamped to [1, 65535]; the kernel additionally caps the effective backlog
+/// at net.core.somaxconn. Port 0 asks the kernel for an ephemeral port.
 [[nodiscard]] FdResult listen_tcp(std::string_view address, std::uint16_t port,
                                   int backlog = 128, bool reuse_port = false);
 

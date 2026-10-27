@@ -554,7 +554,11 @@ void Runtime::Impl::update_me_interest(MeConn& me) {
 }
 
 void Runtime::Impl::update_listener_interest() {
+    // Keep EPOLLIN off while the buffer budget cannot admit a client; otherwise
+    // the reactor accepts sockets only to close them. Housekeeping re-evaluates
+    // this every tick, so acceptance resumes once the budget drains.
     const bool accept = !stopping_ && listener_.valid() &&
+        budget_allows(detail::kBudgetHeadroom + 8192) &&
         (config_.max_connections == 0 ||
          (clients_.size() < static_cast<std::size_t>(config_.max_connections) &&
           shared_->connections.load(std::memory_order_relaxed) <
