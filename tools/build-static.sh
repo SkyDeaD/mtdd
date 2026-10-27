@@ -7,6 +7,9 @@
 # verifies every downloaded archive before extraction, builds the three native
 # dependencies (OpenSSL, libevent, curl) against the musl toolchain sysroot, and
 # fails unless the produced executable has no PT_INTERP and no DT_NEEDED entry.
+# OpenSSL is always built with thread support and the final binary is gated on
+# real pthread lock calls (see tools/verify-static-locks.sh); a no-threads
+# libcrypto crashes concurrent handshakes.
 #
 # Usage:
 #   tools/build-static.sh                 # cached, incremental, full verification
@@ -76,6 +79,17 @@ OPENSSL_VERSION=3.5.9
 OPENSSL_TARBALL=openssl-$OPENSSL_VERSION.tar.gz
 OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 OPENSSL_URL=https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/$OPENSSL_TARBALL
+
+# OpenSSL disables thread support on its own when LDFLAGS contains "-static"
+# (Configure: disable('static', 'pic', 'threads')). A no-threads libcrypto
+# makes CRYPTO_THREAD_* no-ops, so concurrent handshakes corrupt shared
+# provider/namemap state and abort in free(). Configure OpenSSL without the
+# global -static LDFLAGS, request threads explicitly, and keep -pthread in its
+# compile/link flags. The mtdd link itself is still fully static.
+OPENSSL_TARGET=linux-x86_64
+OPENSSL_CONFIG_OPTIONS=(threads no-shared no-module no-dso no-tests no-apps no-docs)
+OPENSSL_CONFIGURE_CFLAGS="-O2 -fno-pie -pthread"
+OPENSSL_CONFIGURE_LDFLAGS="-pthread"
 
 LIBEVENT_VERSION=2.1.13-stable
 LIBEVENT_TARBALL=libevent-$LIBEVENT_VERSION.tar.gz
@@ -167,22 +181,53 @@ log "sysroot:   $SYSROOT"
 # ---------------------------------------------------------------------------
 # Dependencies: isolated musl prefix, static archives only.
 # ---------------------------------------------------------------------------
+# The build id covers every input that changes libcrypto's lock behaviour, so
+# a cached prefix built with different Configure options is rebuilt instead of
+# being reused just because the version string still matches.
+openssl_build_id() {
+    printf '%s\n' \
+        "version=$OPENSSL_VERSION" \
+        "target=$OPENSSL_TARGET" \
+        "options=${OPENSSL_CONFIG_OPTIONS[*]}" \
+        "cflags=$OPENSSL_CONFIGURE_CFLAGS" \
+        "ldflags=$OPENSSL_CONFIGURE_LDFLAGS" \
+        "cc=$CC" \
+        | sha256sum | awk '{print $1}'
+}
+
 build_openssl() {
+    local build_id
+    build_id=$(openssl_build_id)
     if [[ -f $PREFIX/lib/libssl.a && -f $PREFIX/lib/libcrypto.a ]] \
-        && [[ -f $PREFIX/.openssl-version ]] \
-        && [[ $(<"$PREFIX/.openssl-version") == "$OPENSSL_VERSION" ]]; then
+        && [[ -f $PREFIX/.openssl-build-id ]] \
+        && [[ $(<"$PREFIX/.openssl-build-id") == "$build_id" ]]; then
         return
     fi
-    log "building OpenSSL $OPENSSL_VERSION"
+    log "building OpenSSL $OPENSSL_VERSION (threads required, build id $build_id)"
     (
         cd "$SRC/openssl-$OPENSSL_VERSION"
-        ./Configure linux-x86_64 \
-            --prefix="$PREFIX" --libdir=lib --openssldir="$PREFIX/ssl" \
-            no-shared no-module no-dso no-tests no-apps no-docs >"$LOGS/openssl-configure.log" 2>&1
+        if [[ -f Makefile || -f configdata.pm ]]; then
+            log "discarding cached OpenSSL objects (configure options changed)"
+            if [[ -f Makefile ]]; then
+                make clean >"$LOGS/openssl-clean.log" 2>&1 || true
+            fi
+            rm -f configdata.pm Makefile
+            # Objects compiled against the previous configuration must never
+            # be reused, including when "make clean" was unavailable.
+            find . -name '*.o' -delete
+        fi
+        CFLAGS="$OPENSSL_CONFIGURE_CFLAGS" \
+        CXXFLAGS="$OPENSSL_CONFIGURE_CFLAGS" \
+        LDFLAGS="$OPENSSL_CONFIGURE_LDFLAGS" \
+            ./Configure "$OPENSSL_TARGET" "${OPENSSL_CONFIG_OPTIONS[@]}" \
+                --prefix="$PREFIX" --libdir=lib --openssldir="$PREFIX/ssl" \
+                >"$LOGS/openssl-configure.log" 2>&1
+        bash "$REPO_ROOT/tools/verify-static-locks.sh" --configdata-only configdata.pm
         make -j"$JOBS" >"$LOGS/openssl-build.log" 2>&1
         make install_sw >"$LOGS/openssl-install.log" 2>&1
     )
     [[ -f $PREFIX/lib/libssl.a && -f $PREFIX/lib/libcrypto.a ]] || die "OpenSSL static libraries were not installed"
+    printf '%s\n' "$build_id" >"$PREFIX/.openssl-build-id"
     printf '%s\n' "$OPENSSL_VERSION" >"$PREFIX/.openssl-version"
 }
 
@@ -220,7 +265,8 @@ build_curl() {
         --disable-ipfs --disable-websockets
     )
     local build_id
-    build_id=$(printf '%s\n' "$CURL_VERSION" "${args[@]}" | sha256sum | awk '{print $1}')
+    build_id=$(printf '%s\n' "$CURL_VERSION" "openssl=$OPENSSL_BUILD_ID" \
+        "${args[@]}" | sha256sum | awk '{print $1}')
     if [[ -f $PREFIX/lib/libcurl.a && -f $PREFIX/.curl-build-id ]] \
         && [[ $(<"$PREFIX/.curl-build-id") == "$build_id" ]]; then
         return
@@ -239,6 +285,8 @@ build_curl() {
     printf '%s\n' "$build_id" >"$PREFIX/.curl-build-id"
 }
 
+OPENSSL_BUILD_ID=$(openssl_build_id)
+log "OpenSSL build id: $OPENSSL_BUILD_ID"
 build_openssl
 build_libevent
 build_curl
@@ -286,9 +334,9 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
 set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
-set(CMAKE_C_FLAGS_INIT "-O2 -fno-pie -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
-set(CMAKE_CXX_FLAGS_INIT "-O2 -fno-pie -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -no-pie -Wl,--build-id=none")
+set(CMAKE_C_FLAGS_INIT "-O2 -fno-pie -pthread -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
+set(CMAKE_CXX_FLAGS_INIT "-O2 -fno-pie -pthread -ffile-prefix-map=$ROOT=mtdd-static -ffile-prefix-map=$REPO_ROOT=mtdd")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -no-pie -pthread -Wl,--build-id=none")
 EOF
 
 BUILD_DIR="$BUILD/mtdd"
@@ -364,6 +412,12 @@ if grep -aE 'GLIBC_[0-9]' "$BIN" >/dev/null; then
 fi
 grep -aF -- '/etc/ssl/certs/ca-certificates.crt' "$BIN" >/dev/null \
     || die "curl CA bundle default is missing from the binary"
+
+# Hard packaging gate: a no-threads libcrypto links CRYPTO_THREAD_* as no-ops
+# and crashes concurrent handshakes. Verify the linked code, not just inputs.
+log "verifying OpenSSL thread locks in the linked binary"
+bash "$REPO_ROOT/tools/verify-static-locks.sh" \
+    "$BIN" "$SRC/openssl-$OPENSSL_VERSION/configdata.pm" | tee "$OUT/lock-gate.txt"
 
 mkdir -p "$(dirname "$COPY")"
 cp "$BIN" "$OUT/mtdd"
@@ -442,6 +496,7 @@ SIZE=$(stat -c %s "$BIN")
     echo "file=$FILE_DESC"
     echo "toolchain=$TOOLCHAIN_NAME"
     echo "openssl=$OPENSSL_VERSION"
+    echo "openssl_build_id=$OPENSSL_BUILD_ID"
     echo "libevent=$LIBEVENT_VERSION"
     echo "curl=$CURL_VERSION"
     echo "nlohmann_json=3.12.0"
