@@ -79,6 +79,14 @@ inline void trim_scratch(std::vector<std::uint8_t>& buffer) {
 // readiness event.
 inline constexpr std::size_t kMeReadyBatch = 64;
 inline constexpr std::chrono::milliseconds kMeReadyWakeDelay{1};
+// Concurrent dial/handshake budget per DC pool. The pool target follows demand,
+// so a cold start or a load step would otherwise open every missing writer at
+// once; a shortfall is filled as earlier attempts finish instead.
+inline constexpr std::size_t kMePendingBatch = 4;
+// Socket attempts admitted by one ensure_me() call. A pool target of 24 is
+// reached over several ticks, and a synchronously failing endpoint cannot turn
+// one call into a connect storm.
+inline constexpr std::size_t kMeDialBatch = 4;
 
 // Bound for configured reactors. Fixed-size statistic arrays use the same cap.
 inline constexpr std::size_t kMaxWorkers = 256;

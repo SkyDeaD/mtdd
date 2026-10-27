@@ -432,10 +432,21 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
     // Bound sockets and fixed session overhead even when metadata lists many
     // DCs. Reserve one slot for successor-first metadata replacement.
     std::size_t reactor_writers = 0;
+    // Members already dialling or handshaking for this generation. The pool
+    // target is reached as a batch, so this is what keeps a cold pool from
+    // opening all missing writers in one burst.
+    std::size_t pending = 0;
     if (me_generation_count(pool, generation) < target) {
         for (const auto& [other_dc, other_pool] : me_pool_) {
             (void)other_dc;
             reactor_writers += other_pool.conns.size();
+        }
+        for (const auto& member : pool.conns) {
+            if (!member || member->draining || member->generation != generation) continue;
+            if (member->state == MeConn::State::connecting ||
+                member->state == MeConn::State::handshaking) {
+                ++pending;
+            }
         }
     }
     const bool successor = pool.serving_generation != 0 &&
@@ -444,17 +455,13 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
     // Fill the slots of the requested generation only. The working generation
     // may still be present (successor-first replacement), so counting every
     // non-draining slot would suppress the successor entirely.
+    std::size_t dialed = 0;
     while (me_generation_count(pool, generation) < target &&
            pool.conns.size() < 2U * config_.me_connections_per_dc &&
-           reactor_writers < reactor_limit) {
+           reactor_writers < reactor_limit &&
+           pending < detail::kMePendingBatch &&
+           dialed < detail::kMeDialBatch) {
         if (me_generation_count(pool, generation) > 0 && !budget_allows(65536)) break;
-        const bool pending = std::any_of(pool.conns.begin(), pool.conns.end(),
-            [generation](const auto& member) {
-                return member && !member->draining && member->generation == generation &&
-                    (member->state == MeConn::State::connecting ||
-                     member->state == MeConn::State::handshaking);
-            });
-        if (pending) break;
         MeConn* connection = nullptr;
         try {
             auto owned = std::make_unique<MeConn>();
@@ -496,6 +503,14 @@ Runtime::Impl::MeConn* Runtime::Impl::ensure_me(std::int16_t dc, Time now) {
             }
             break;
         }
+        ++dialed;
+        // A successful attempt is now a concurrent handshake and counts against
+        // the pool bound; a synchronous failure leaves a backoff member, which
+        // does not occupy a dial slot.
+        if (connection->state == MeConn::State::connecting ||
+            connection->state == MeConn::State::handshaking) {
+            ++pending;
+        }
     }
     publish_me_pool(dc);
     recompute_ready();
@@ -527,12 +542,15 @@ void Runtime::Impl::scale_me_pool(std::int16_t dc, Time now) {
     const auto found = me_pool_.find(dc);
     if (found == me_pool_.end()) return;
     DcPool& pool = found->second;
-    if (pool.desired_generation == 0 || now < pool.next_scale) return;
-    pool.next_scale = now + std::chrono::seconds(10);
-    if (me_generation_count(pool, pool.desired_generation) < pool.scale_target &&
-        budget_allows(65536)) {
+    if (pool.desired_generation == 0) return;
+    // A shortfall against the current target is filled on every tick, not only
+    // on the 10 s scaling decision. ensure_me() owns the batch bounds, so the
+    // pool ramps quickly after a restart without opening all writers at once.
+    if (me_generation_count(pool, pool.desired_generation) < pool.scale_target) {
         (void)ensure_me(dc, now);
     }
+    if (now < pool.next_scale) return;
+    pool.next_scale = now + std::chrono::seconds(10);
 
     std::size_t clients = 0;
     std::size_t active = 0;
@@ -550,6 +568,39 @@ void Runtime::Impl::scale_me_pool(std::int16_t dc, Time now) {
                     queued >= config_.connection_queue_bytes * 3 / 4;
     }
     pool.pressure_samples = pressure ? std::min(pool.pressure_samples + 1, 2U) : 0;
+    // Fast ramp: demand alone sets the target up to the configured cap instead
+    // of one writer per decision. ceil() so a partial writer is always enough
+    // for the clients it carries; scale-down keeps its hysteresis below.
+    const std::size_t per_writer =
+        std::max<std::size_t>(config_.me_clients_per_writer, 1);
+    const std::size_t needed = (clients + per_writer - 1) / per_writer;
+    const std::size_t ramp = std::min(
+        needed, static_cast<std::size_t>(config_.me_connections_per_dc));
+    if (ramp > pool.scale_target) {
+        const std::size_t delta = ramp - pool.scale_target;
+        pool.scale_target = ramp;
+        pool.scale_up_total += delta;
+        pool.low_load_since = Time{};
+        // Reviving a scale-drained member is cheaper than dialling a new socket
+        // and keeps its already-handshaked session.
+        std::size_t revived = 0;
+        for (auto& connection : pool.conns) {
+            if (revived >= delta) break;
+            if (!connection || !connection->scale_draining) continue;
+            if (connection->generation != pool.desired_generation) continue;
+            if (connection->state != MeConn::State::ready) continue;
+            connection->scale_draining = false;
+            connection->draining = false;
+            connection->draining_deadline = Time{};
+            ++revived;
+        }
+        (void)ensure_me(dc, now);
+        if (revived > 0) {
+            publish_me_pool(dc);
+            recompute_ready();
+        }
+        return;
+    }
     const bool needs_more = clients > active * config_.me_clients_per_writer ||
                             pool.pressure_samples >= 2;
     if (needs_more && pool.scale_target < config_.me_connections_per_dc && !connecting) {

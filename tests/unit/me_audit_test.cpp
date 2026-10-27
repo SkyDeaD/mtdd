@@ -637,6 +637,93 @@ TEST(MeAudit, DynamicPoolRequiresSustainedQueuePressure) {
     EXPECT_EQ(dc.scale_up_total, 1U);
 }
 
+TEST(MeAudit, DemandRaisesPoolTargetInOneScalingDecision) {
+    AuditReactor test("ramp-target");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->config_.me_connections_per_dc = 24;
+    test.reactor->config_.me_clients_per_writer = 10;
+    test.reactor->metadata_snapshot_ = me_metadata(1);
+    auto& pool = test.reactor->me_pool_[2];
+    pool.desired_generation = pool.serving_generation = 1;
+    auto owned = std::make_unique<Impl::MeConn>();
+    auto* first = owned.get();
+    first->dc = 2;
+    first->generation = 1;
+    first->state = Impl::MeConn::State::ready;
+    first->clients = 31;
+    first->out.emplace(test.config.connection_queue_bytes);
+    pool.conns.push_back(std::move(owned));
+
+    // ceil(31 / 10) = 4 writers. The target must jump on the first decision (a
+    // restart used to add one writer per 10 s decision, which starved the pool
+    // for minutes at load), while the sockets still follow the batch bounds.
+    test.reactor->scale_me_pool(2, now);
+    EXPECT_EQ(pool.scale_target, 4U);
+    EXPECT_EQ(test.reactor->stats_.snapshot().me_dcs.at("2").pool_target, 4U);
+    EXPECT_EQ(test.reactor->stats_.snapshot().me_dcs.at("2").scale_up_total, 3U);
+    EXPECT_EQ(pool.conns.size(), 4U);
+    EXPECT_FALSE(first->draining);
+}
+
+TEST(MeAudit, DemandRampCapsAtConfiguredWritersAndOpensInBatches) {
+    AuditReactor test("ramp-batch");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->config_.me_connections_per_dc = 24;
+    test.reactor->config_.me_clients_per_writer = 10;
+    test.reactor->metadata_snapshot_ = me_metadata(1);
+    auto& pool = test.reactor->me_pool_[2];
+    pool.desired_generation = pool.serving_generation = 1;
+    auto owned = std::make_unique<Impl::MeConn>();
+    owned->dc = 2;
+    owned->generation = 1;
+    owned->state = Impl::MeConn::State::ready;
+    owned->clients = 1000000;
+    owned->out.emplace(test.config.connection_queue_bytes);
+    pool.conns.push_back(std::move(owned));
+
+    test.reactor->scale_me_pool(2, now);
+    EXPECT_EQ(pool.scale_target, 24U) << "demand must not raise the cap";
+    ASSERT_EQ(pool.conns.size(), 1U + mtdd::detail::kMeDialBatch)
+        << "one decision must not open every missing socket at once";
+    // The new sockets are dialling, so the concurrent batch is full and another
+    // tick must not add sockets on top of it.
+    test.reactor->scale_me_pool(2, now);
+    EXPECT_EQ(pool.conns.size(), 1U + mtdd::detail::kMeDialBatch);
+    // A batch that fails to connect releases its slots; the fill path runs
+    // before the 10 s decision gate, so the same decision interval continues the
+    // ramp instead of waiting one decision per writer.
+    for (auto& member : pool.conns) member->state = Impl::MeConn::State::backoff;
+    test.reactor->scale_me_pool(2, now);
+    EXPECT_EQ(pool.conns.size(), 1U + 2U * mtdd::detail::kMeDialBatch);
+    EXPECT_EQ(test.reactor->stats_.snapshot().me_dcs.at("2").pool_target, 24U);
+    EXPECT_EQ(test.reactor->stats_.snapshot().me_dcs.at("2").scale_up_total, 23U);
+}
+
+TEST(MeAudit, PendingHandshakeBatchBoundsNewDials) {
+    AuditReactor test("pending-batch");
+    using Impl = mtdd::Runtime::Impl;
+    const auto now = Impl::Clock::now();
+    test.reactor->config_.me_connections_per_dc = 24;
+    test.reactor->metadata_snapshot_ = me_metadata(1);
+    auto& pool = test.reactor->me_pool_[2];
+    pool.desired_generation = pool.serving_generation = 1;
+    pool.scale_target = 8;
+    for (std::size_t i = 0; i < mtdd::detail::kMePendingBatch; ++i) {
+        auto member = std::make_unique<Impl::MeConn>();
+        member->dc = 2;
+        member->generation = 1;
+        member->state = i % 2 == 0 ? Impl::MeConn::State::connecting
+                                   : Impl::MeConn::State::handshaking;
+        member->out.emplace(test.config.connection_queue_bytes);
+        pool.conns.push_back(std::move(member));
+    }
+    test.reactor->ensure_me(2, now);
+    EXPECT_EQ(pool.conns.size(), mtdd::detail::kMePendingBatch)
+        << "a full dial/handshake batch must not open another socket";
+}
+
 TEST(MeAudit, WriterCapReservesCapacityForMetadataReplacement) {
     AuditReactor test("elastic-cap");
     using Impl = mtdd::Runtime::Impl;
