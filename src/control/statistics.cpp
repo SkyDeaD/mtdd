@@ -143,6 +143,17 @@ void append_metric(std::ostringstream& out, std::string_view name,
   out << ' ' << value << '\n';
 }
 
+uint64_t monotonic_ns() noexcept {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+std::string worker_label(std::size_t worker) {
+  return "worker=\"" + std::to_string(worker) + "\"";
+}
+
 }  // namespace
 
 const char* to_string(RejectReason reason) noexcept {
@@ -265,20 +276,49 @@ struct Statistics::Impl {
     std::atomic<uint64_t> direct_budget_pauses{0};
   };
 
+  // Per-reactor ME budget/read diagnostics. Deliberately NOT folded into
+  // MeSlot: MeSlot is aggregated across reactors by snapshot(), while these
+  // values must stay attributable to one worker.
+  struct MeWorkerGauges {
+    std::atomic<uint64_t> connections{0};
+    std::atomic<uint64_t> ready_connections{0};
+    std::atomic<uint64_t> read_armed_connections{0};
+    std::atomic<uint64_t> budget_paused_connections{0};
+    std::atomic<uint64_t> bound_clients_on_paused{0};
+    std::atomic<uint64_t> budget_pauses{0};
+    std::atomic<uint64_t> budget_resumes{0};
+    std::atomic<uint64_t> current_pause_age_ms{0};
+    std::atomic<uint64_t> max_pause_age_ms{0};
+    std::atomic<uint64_t> worst_writer_rtt_us{0};
+    std::atomic<uint64_t> slow_writers{0};
+    std::atomic<uint64_t> slow_evictions{0};
+  };
+
   // Gauges owned by one reactor. snapshot() sums them (boolean OR for
   // `connected`, max for the shared replay-cache size, min for the last-answer
-  // age). Process-lifetime ME counters have no owning reactor and are
-  // accumulated in slot 0 with atomics; the snapshot still walks every slot, so
-  // each increment is counted exactly once.
+  // age). ME request/answer outcome counters are reactor-sharded into the
+  // writer's fixed slot (worker % kMaxWorkers); the remaining process-lifetime
+  // ME counters have no owning reactor and are accumulated in slot 0 with
+  // atomics. snapshot() sums the sharded fields over the monotonic
+  // high-water bound of ever-addressable/touched slots, so each increment is
+  // counted exactly once without a fixed 256-slot sweep.
   struct WorkerGauges {
     std::atomic<bool> ready{false};
     std::array<std::atomic<uint64_t>, kBufferStateCount> buffer_bytes;
     std::atomic<uint64_t> buffer_budget_used{0};
+    std::atomic<uint64_t> budget_limit_bytes{0};
+    std::atomic<uint64_t> active_clients{0};
     std::atomic<uint64_t> handshakes_pending{0};
     std::atomic<uint64_t> client_pool_objects{0};
     std::atomic<uint64_t> replay_cache{0};
     std::atomic<uint64_t> me_pending_bytes{0};
+    // Monotonic liveness. heartbeat_ns is a steady_clock epoch timestamp
+    // (0 = never published); snapshot() derives the age against its own clock.
+    std::atomic<uint64_t> heartbeat_ns{0};
+    std::atomic<uint64_t> housekeeping_lateness_ms{0};
+    std::atomic<uint64_t> housekeeping_lateness_max_ms{0};
     std::array<MeSlot, kMeSlotCount> me;  // zero-initialized by MeSlot defaults
+    std::array<MeWorkerGauges, kMeSlotCount> me_worker;
   };
 
   Impl(size_t max_tracked_users, std::chrono::steady_clock::time_point start)
@@ -292,8 +332,40 @@ struct Statistics::Impl {
     for (auto& cell : api_cells) cell.store(0);
   }
 
+  // Covers `slot` (an index, not a count) for later snapshot sweeps. The
+  // caller has already published its relaxed increment; the release RMW below
+  // orders that increment before the raised bound becomes visible to a
+  // snapshot that acquire-loads it. Already-covered slots do not RMW.
+  void publish_slot(size_t slot) noexcept {
+    raise_high_water(slot + 1);
+  }
+
+  void raise_high_water(size_t required) noexcept {
+    required = std::min(required, kMaxWorkers);
+    size_t bound = shard_high_water.slots.load(std::memory_order_relaxed);
+    while (required > bound &&
+           !shard_high_water.slots.compare_exchange_weak(
+               bound, required, std::memory_order_release,
+               std::memory_order_relaxed)) {
+    }
+  }
+
   std::chrono::steady_clock::time_point started_at;
   std::atomic<size_t> worker_count{1};
+  // Monotonic high-water bound (1..kMaxWorkers) of fixed counter slots that a
+  // writer may have used: raised by configure_workers() and lazily by the
+  // sharded ME counter overloads on first use of their slot. It never shrinks,
+  // so shrinking the worker count cannot hide cumulative history. Only writers
+  // on a not-yet-covered slot perform a RMW; the steady-state hot path is one
+  // relaxed load that stays read-mostly. The release publication of a raised
+  // bound pairs with the acquire load in snapshot(): a slot increment that
+  // happened before the raise is visible to readers that observe the new bound.
+  // alignas(64) keeps the shared hot read off the line of gauges[0], which is
+  // written per packet by worker 0.
+  struct alignas(64) ShardHighWater {
+    std::atomic<size_t> slots{1};  // slot 0 always exists (legacy API)
+  };
+  ShardHighWater shard_high_water{};
   std::array<WorkerGauges, kMaxWorkers> gauges;
   mutable std::mutex build_mutex;
   std::string build_version;
@@ -332,6 +404,9 @@ void Statistics::configure_workers(std::size_t workers) noexcept {
     workers = Statistics::Impl::kMaxWorkers;
   }
   impl_->worker_count.store(workers, std::memory_order_relaxed);
+  // Addressable worker slots are part of the cumulative sweep bound even
+  // before their first write; the bound never shrinks on reconfiguration.
+  impl_->raise_high_water(workers);
 }
 
 void Statistics::set_ready(bool ready) noexcept {
@@ -493,6 +568,45 @@ void Statistics::set_replay_cache_entries(std::size_t worker,
       entries, std::memory_order_relaxed);
 }
 
+void Statistics::set_worker_diagnostics(std::size_t worker,
+                                        uint64_t budget_used_bytes,
+                                        uint64_t budget_limit_bytes,
+                                        uint64_t active_clients,
+                                        uint64_t handshakes_pending) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& gauges = impl_->gauges[worker % count];
+  gauges.buffer_budget_used.store(budget_used_bytes,
+                                  std::memory_order_relaxed);
+  gauges.budget_limit_bytes.store(budget_limit_bytes,
+                                  std::memory_order_relaxed);
+  gauges.active_clients.store(active_clients, std::memory_order_relaxed);
+  gauges.handshakes_pending.store(handshakes_pending,
+                                  std::memory_order_relaxed);
+}
+
+void Statistics::set_worker_heartbeat(std::size_t worker) noexcept {
+  set_worker_heartbeat_at(worker, monotonic_ns());
+}
+
+void Statistics::set_worker_heartbeat_at(std::size_t worker,
+                                         uint64_t monotonic_ns_value) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  impl_->gauges[worker % count].heartbeat_ns.store(
+      monotonic_ns_value, std::memory_order_relaxed);
+}
+
+void Statistics::set_worker_housekeeping_lateness(std::size_t worker,
+                                                  uint64_t last_ms,
+                                                  uint64_t max_ms) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& gauges = impl_->gauges[worker % count];
+  gauges.housekeeping_lateness_ms.store(last_ms, std::memory_order_relaxed);
+  gauges.housekeeping_lateness_max_ms.store(max_ms, std::memory_order_relaxed);
+}
+
 void Statistics::api_request(ApiRoute route, ApiMethod method, int status) noexcept {
   impl_->api_total.fetch_add(1, std::memory_order_relaxed);
   impl_->api_cells[api_cell(route, method, status)].fetch_add(
@@ -513,14 +627,25 @@ void Statistics::me_connected(std::size_t worker, int dc,
   slot.connected.store(connected, std::memory_order_relaxed);
 }
 void Statistics::me_reconnect(int dc) noexcept {
-  // Process-lifetime ME counters are not owned by a reactor, so every reactor
-  // accumulates them in slot 0. snapshot() sums slots exactly once, and the
-  // increments are atomic, so N reactors cannot multiply a total.
+  // The reconnect counter is not reactor-owned, so every reactor accumulates it
+  // in slot 0. snapshot() sums slots exactly once, and the increments are
+  // atomic, so N reactors cannot multiply a total. Request/answer outcomes are
+  // sharded separately by worker (see me_request/me_answer below).
   impl_->gauges[0].me[me_slot(dc)].reconnects.fetch_add(
       1, std::memory_order_relaxed);
 }
 void Statistics::me_request(int dc, MeResult result) noexcept {
-  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  me_request(0, dc, result);
+}
+void Statistics::me_request(std::size_t worker, int dc,
+                            MeResult result) noexcept {
+  // Route by the fixed statistics capacity, not by the configured worker
+  // count: a worker id that was valid before a reconfiguration must keep its
+  // slot. The slot is published to the monotonic high-water bound after the
+  // increment, so snapshot() can stop at the highest slot ever touched and the
+  // steady state costs one relaxed load instead of a per-packet RMW.
+  const std::size_t shard = worker % Impl::kMaxWorkers;
+  auto& slot = impl_->gauges[shard].me[me_slot(dc)];
   switch (result) {
     case MeResult::success:
       slot.requests_success.fetch_add(1, std::memory_order_relaxed);
@@ -532,9 +657,15 @@ void Statistics::me_request(int dc, MeResult result) noexcept {
       slot.requests_timeout.fetch_add(1, std::memory_order_relaxed);
       break;
   }
+  impl_->publish_slot(shard);
 }
 void Statistics::me_answer(int dc, MeAnswerResult result) noexcept {
-  auto& slot = impl_->gauges[0].me[me_slot(dc)];
+  me_answer(0, dc, result);
+}
+void Statistics::me_answer(std::size_t worker, int dc,
+                           MeAnswerResult result) noexcept {
+  const std::size_t shard = worker % Impl::kMaxWorkers;
+  auto& slot = impl_->gauges[shard].me[me_slot(dc)];
   switch (result) {
     case MeAnswerResult::received:
       slot.ans_received.fetch_add(1, std::memory_order_relaxed);
@@ -549,6 +680,7 @@ void Statistics::me_answer(int dc, MeAnswerResult result) noexcept {
       slot.ans_dropped_other.fetch_add(1, std::memory_order_relaxed);
       break;
   }
+  impl_->publish_slot(shard);
 }
 void Statistics::me_control(int dc, uint64_t close_conn, uint64_t close_ext,
                             uint64_t unknown, uint64_t malformed) noexcept {
@@ -648,6 +780,34 @@ void Statistics::me_pool(std::size_t worker, int dc, uint64_t connections,
   slot.pool_connections.store(connections, std::memory_order_relaxed);
   slot.pool_ready.store(ready, std::memory_order_relaxed);
 }
+void Statistics::me_worker(std::size_t worker, int dc,
+                           const MeWorkerSnapshot& values) noexcept {
+  const std::size_t count =
+      impl_->worker_count.load(std::memory_order_relaxed);
+  auto& slot = impl_->gauges[worker % count].me_worker[me_slot(dc)];
+  slot.connections.store(values.connections, std::memory_order_relaxed);
+  slot.ready_connections.store(values.ready_connections,
+                               std::memory_order_relaxed);
+  slot.read_armed_connections.store(values.read_armed_connections,
+                                    std::memory_order_relaxed);
+  slot.budget_paused_connections.store(values.budget_paused_connections,
+                                       std::memory_order_relaxed);
+  slot.bound_clients_on_paused.store(values.bound_clients_on_paused,
+                                     std::memory_order_relaxed);
+  slot.budget_pauses.store(values.budget_pauses_total,
+                           std::memory_order_relaxed);
+  slot.budget_resumes.store(values.budget_resumes_total,
+                            std::memory_order_relaxed);
+  slot.current_pause_age_ms.store(values.current_pause_age_ms,
+                                  std::memory_order_relaxed);
+  slot.max_pause_age_ms.store(values.max_pause_age_ms,
+                              std::memory_order_relaxed);
+  slot.worst_writer_rtt_us.store(values.worst_writer_rtt_us,
+                                 std::memory_order_relaxed);
+  slot.slow_writers.store(values.slow_writers, std::memory_order_relaxed);
+  slot.slow_evictions.store(values.slow_evictions_total,
+                            std::memory_order_relaxed);
+}
 void Statistics::me_pool_scaling(std::size_t worker, int dc, uint64_t target,
                                  uint64_t clients, uint64_t up, uint64_t down,
                                  uint64_t failures) noexcept {
@@ -708,6 +868,14 @@ StatisticsSnapshot Statistics::snapshot() const {
   out.ready = ready();
   const std::size_t workers =
       impl_->worker_count.load(std::memory_order_relaxed);
+  // Cumulative request/answer shards are swept once per snapshot up to the
+  // monotonic high-water bound of touched/addressable slots, not the full
+  // fixed capacity. The single acquire load pairs with the release raises in
+  // publish_slot()/configure_workers(), so slots covered by the observed bound
+  // are visible to the relaxed loads below.
+  const std::size_t cumulative_slots = std::min(
+      impl_->shard_high_water.slots.load(std::memory_order_acquire),
+      Impl::kMaxWorkers);
   out.connections_accepted_total =
       impl_->accepted.load(std::memory_order_relaxed);
   out.connections_active = impl_->active.load(std::memory_order_relaxed);
@@ -740,15 +908,19 @@ StatisticsSnapshot Statistics::snapshot() const {
   uint64_t client_pool_objects = 0;
   uint64_t replay_entries = 0;
   uint64_t me_pending_bytes = 0;
+  out.workers.resize(workers);
+  const uint64_t now_ns = monotonic_ns();
   for (std::size_t worker = 0; worker < workers; ++worker) {
     const auto& gauges = impl_->gauges[worker];
     for (size_t i = 0; i < kBufferStateCount; ++i) {
       out.buffer_bytes[i] += gauges.buffer_bytes[i].load(std::memory_order_relaxed);
     }
-    buffer_budget_used +=
+    const uint64_t worker_budget_used =
         gauges.buffer_budget_used.load(std::memory_order_relaxed);
-    handshakes_pending +=
+    buffer_budget_used += worker_budget_used;
+    const uint64_t worker_handshakes =
         gauges.handshakes_pending.load(std::memory_order_relaxed);
+    handshakes_pending += worker_handshakes;
     client_pool_objects +=
         gauges.client_pool_objects.load(std::memory_order_relaxed);
     // The replay cache is shared by every reactor, so all workers publish the
@@ -757,6 +929,54 @@ StatisticsSnapshot Statistics::snapshot() const {
         replay_entries, gauges.replay_cache.load(std::memory_order_relaxed));
     me_pending_bytes +=
         gauges.me_pending_bytes.load(std::memory_order_relaxed);
+
+    WorkerSnapshot& worker_out = out.workers[worker];
+    worker_out.budget_used_bytes = worker_budget_used;
+    worker_out.budget_limit_bytes =
+        gauges.budget_limit_bytes.load(std::memory_order_relaxed);
+    worker_out.active_clients =
+        gauges.active_clients.load(std::memory_order_relaxed);
+    worker_out.handshakes_pending = worker_handshakes;
+    const uint64_t heartbeat_ns =
+        gauges.heartbeat_ns.load(std::memory_order_relaxed);
+    if (heartbeat_ns != 0) {
+      worker_out.heartbeat_seen = true;
+      // Clamp a timestamp from the future to zero rather than underflowing.
+      worker_out.heartbeat_age_ms =
+          now_ns > heartbeat_ns ? (now_ns - heartbeat_ns) / 1'000'000 : 0;
+    }
+    worker_out.housekeeping_lateness_ms =
+        gauges.housekeeping_lateness_ms.load(std::memory_order_relaxed);
+    worker_out.housekeeping_lateness_max_ms =
+        gauges.housekeeping_lateness_max_ms.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < kMeSlotCount; ++i) {
+      const auto& source = gauges.me_worker[i];
+      MeWorkerSnapshot& target = worker_out.me_dcs[kMeLabels[i]];
+      target.connections =
+          source.connections.load(std::memory_order_relaxed);
+      target.ready_connections =
+          source.ready_connections.load(std::memory_order_relaxed);
+      target.read_armed_connections =
+          source.read_armed_connections.load(std::memory_order_relaxed);
+      target.budget_paused_connections =
+          source.budget_paused_connections.load(std::memory_order_relaxed);
+      target.bound_clients_on_paused =
+          source.bound_clients_on_paused.load(std::memory_order_relaxed);
+      target.budget_pauses_total =
+          source.budget_pauses.load(std::memory_order_relaxed);
+      target.budget_resumes_total =
+          source.budget_resumes.load(std::memory_order_relaxed);
+      target.current_pause_age_ms =
+          source.current_pause_age_ms.load(std::memory_order_relaxed);
+      target.max_pause_age_ms =
+          source.max_pause_age_ms.load(std::memory_order_relaxed);
+      target.worst_writer_rtt_us =
+          source.worst_writer_rtt_us.load(std::memory_order_relaxed);
+      target.slow_writers =
+          source.slow_writers.load(std::memory_order_relaxed);
+      target.slow_evictions_total =
+          source.slow_evictions.load(std::memory_order_relaxed);
+    }
   }
   out.backpressure_c2s_total =
       impl_->backpressure_c2s.load(std::memory_order_relaxed);
@@ -816,12 +1036,6 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.ping_stall.load(std::memory_order_relaxed);
       entry.reconnects_total +=
           slot.reconnects.load(std::memory_order_relaxed);
-      entry.requests_success +=
-          slot.requests_success.load(std::memory_order_relaxed);
-      entry.requests_failure +=
-          slot.requests_failure.load(std::memory_order_relaxed);
-      entry.requests_timeout +=
-          slot.requests_timeout.load(std::memory_order_relaxed);
       entry.ready_queue_depth +=
           slot.ready_depth.load(std::memory_order_relaxed);
       entry.ready_queue_clients +=
@@ -830,14 +1044,6 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.frames_bytes.load(std::memory_order_relaxed);
       entry.out_queued_bytes +=
           slot.out_bytes.load(std::memory_order_relaxed);
-      entry.proxy_ans_received_total +=
-          slot.ans_received.load(std::memory_order_relaxed);
-      entry.proxy_ans_delivered_total +=
-          slot.ans_delivered.load(std::memory_order_relaxed);
-      entry.proxy_ans_dropped_unknown_total +=
-          slot.ans_dropped_unknown.load(std::memory_order_relaxed);
-      entry.proxy_ans_dropped_other_total +=
-          slot.ans_dropped_other.load(std::memory_order_relaxed);
       if (slot.ans_seen.load(std::memory_order_relaxed)) {
         const uint64_t age =
             slot.last_ans_age.load(std::memory_order_relaxed);
@@ -868,6 +1074,29 @@ StatisticsSnapshot Statistics::snapshot() const {
           slot.direct_tx.load(std::memory_order_relaxed);
       entry.direct_budget_pauses_total +=
           slot.direct_budget_pauses.load(std::memory_order_relaxed);
+    }
+    // Request/answer outcomes are cumulative and were written into the
+    // reactor's fixed slot (worker % 256). They are not gauges of the current
+    // worker set, so sweep up to the monotonic high-water bound: shrinking the
+    // worker count must not hide history, while untouched high slots cost
+    // nothing. Summing outside the active loop keeps the totals independent of
+    // reconfiguration.
+    for (std::size_t worker = 0; worker < cumulative_slots; ++worker) {
+      const auto& cumulative = impl_->gauges[worker].me[i];
+      entry.requests_success +=
+          cumulative.requests_success.load(std::memory_order_relaxed);
+      entry.requests_failure +=
+          cumulative.requests_failure.load(std::memory_order_relaxed);
+      entry.requests_timeout +=
+          cumulative.requests_timeout.load(std::memory_order_relaxed);
+      entry.proxy_ans_received_total +=
+          cumulative.ans_received.load(std::memory_order_relaxed);
+      entry.proxy_ans_delivered_total +=
+          cumulative.ans_delivered.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_unknown_total +=
+          cumulative.ans_dropped_unknown.load(std::memory_order_relaxed);
+      entry.proxy_ans_dropped_other_total +=
+          cumulative.ans_dropped_other.load(std::memory_order_relaxed);
     }
     entry.ping_rtt_us = rtt_samples == 0 ? 0 : rtt_sum / rtt_samples;
     entry.proxy_ans_seen = answer_seen;
@@ -1103,6 +1332,62 @@ std::string Statistics::prometheus_text() const {
     if (me.direct_budget_pauses_total != 0) {
       append_metric(out, "mtdd_direct_budget_pauses_total", dc_label,
                     me.direct_budget_pauses_total);
+    }
+  }
+  // Per-worker diagnostics. These are not alternatives to the summed gauges:
+  // the aggregate can hide one reactor at its local budget limit. Worker and DC
+  // labels are fixed; no addresses, client ids or payloads are exposed.
+  for (size_t w = 0; w < snapshot.workers.size(); ++w) {
+    const WorkerSnapshot& worker = snapshot.workers[w];
+    const std::string label = worker_label(w);
+    append_metric(out, "mtdd_worker_budget_used_bytes", label,
+                  worker.budget_used_bytes);
+    append_metric(out, "mtdd_worker_budget_limit_bytes", label,
+                  worker.budget_limit_bytes);
+    append_metric(out, "mtdd_worker_active_clients", label,
+                  worker.active_clients);
+    append_metric(out, "mtdd_worker_handshakes_pending", label,
+                  worker.handshakes_pending);
+    if (worker.heartbeat_seen) {
+      append_metric(out, "mtdd_worker_heartbeat_age_ms", label,
+                    worker.heartbeat_age_ms);
+    }
+    append_metric(out, "mtdd_worker_housekeeping_lateness_ms", label,
+                  worker.housekeeping_lateness_ms);
+    append_metric(out, "mtdd_worker_housekeeping_lateness_max_ms", label,
+                  worker.housekeeping_lateness_max_ms);
+    for (size_t i = 0; i < kMeSlotCount; ++i) {
+      const auto found = worker.me_dcs.find(kMeLabels[i]);
+      if (found == worker.me_dcs.end()) continue;
+      const MeWorkerSnapshot& me = found->second;
+      const std::string me_label =
+          label + ",dc=\"" + kMeLabels[i] + "\"";
+      append_metric(out, "mtdd_worker_me_connections", me_label,
+                    me.connections);
+      append_metric(out, "mtdd_worker_me_ready", me_label,
+                    me.ready_connections);
+      // Actual epoll read interest of this reactor's ME sockets, not a
+      // derived expectation: a paused read is absent from the mask.
+      append_metric(out, "mtdd_worker_me_read_armed", me_label,
+                    me.read_armed_connections);
+      append_metric(out, "mtdd_worker_me_budget_paused", me_label,
+                    me.budget_paused_connections);
+      append_metric(out, "mtdd_worker_me_paused_bound_clients", me_label,
+                    me.bound_clients_on_paused);
+      append_metric(out, "mtdd_worker_me_budget_pauses_total", me_label,
+                    me.budget_pauses_total);
+      append_metric(out, "mtdd_worker_me_budget_resumes_total", me_label,
+                    me.budget_resumes_total);
+      append_metric(out, "mtdd_worker_me_pause_current_ms", me_label,
+                    me.current_pause_age_ms);
+      append_metric(out, "mtdd_worker_me_pause_max_ms", me_label,
+                    me.max_pause_age_ms);
+      append_metric(out, "mtdd_worker_me_worst_writer_rtt_us", me_label,
+                    me.worst_writer_rtt_us);
+      append_metric(out, "mtdd_worker_me_slow_writers", me_label,
+                    me.slow_writers);
+      append_metric(out, "mtdd_worker_me_slow_evictions_total", me_label,
+                    me.slow_evictions_total);
     }
   }
   append_metric(out, "mtdd_me_pending_buffer_bytes", "",

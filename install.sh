@@ -1789,6 +1789,18 @@ config = json.loads(Path('/etc/mtdd/config.json').read_text())
 config['public_host'] = os.environ['MTDD_PUBLIC_HOST']
 if os.environ['MTDD_PUBLIC_PORT']:
     config['public_port'] = int(os.environ['MTDD_PUBLIC_PORT'])
+# Capacity defaults for thousands of concurrent clients. Only missing keys are
+# filled, so an operator's explicit values survive every update. The relay
+# buffer budget scales with RAM (a quarter, 64 MiB..1 GiB): the old 64 MiB
+# default is split over the reactors and runs out at a few thousand clients,
+# which pauses the shared ME reads and stalls everyone.
+try:
+    ram = next(int(l.split()[1]) * 1024 for l in open('/proc/meminfo') if l.startswith('MemTotal:'))
+except (OSError, StopIteration, ValueError):
+    ram = 0
+if ram:
+    config.setdefault('global_buffer_bytes', max(64 << 20, min(ram // 4, 1 << 30)))
+config.setdefault('me_connections_per_dc', 16)
 Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + '\n')
 PY
     "$staged" --config "$config_candidate" --check-config >/dev/null || die 'Проверка конфигурации не пройдена'
@@ -1796,6 +1808,7 @@ PY
     chmod 0640 "$config_candidate"
     mv -f -- "$config_candidate" "$MTDD_CONF"
     mv -f -- "$staged" "$output"
+    tune_kernel
     install -d -m 0755 /etc/systemd/system
     install -m 0644 /dev/stdin "$MTDD_UNIT" <<'EOF'
 [Unit]
@@ -1811,6 +1824,7 @@ EnvironmentFile=/etc/mtdd/credentials.env
 ExecStart=/usr/local/bin/mtdd --config /etc/mtdd/config.json
 Restart=on-failure
 RestartSec=3
+LimitNOFILE=1048576
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
@@ -1844,6 +1858,76 @@ EOF
     step 'API-токен:  /etc/mtdd/credentials.env (только root)'
     warn 'Откройте публичный TCP-порт в firewall и настройте NAT при необходимости.'
     line
+}
+
+# Ядро по умолчанию рассчитано на сотни соединений: очередь приёма, число
+# orphan-сокетов и лимит памяти TCP быстро упираются в потолок при тысячах
+# клиентов (ListenOverflows, «too many orphaned sockets», обрывы рукопожатий).
+# Значения только повышаются: если оператор уже задал больше, оно сохраняется.
+tune_kernel() {
+    local conf=/etc/sysctl.d/99-mtdd-load.conf
+    step 'Настраиваю параметры ядра для большого числа клиентов…'
+    install -d -m 0755 /etc/sysctl.d
+    if ! python3 - "$conf" <<'PY'
+import os, sys
+from pathlib import Path
+
+def read(key):
+    try:
+        return Path('/proc/sys/' + key.replace('.', '/')).read_text().split()
+    except OSError:
+        return None
+
+try:
+    pages = next(int(l.split()[1]) // 4 for l in open('/proc/meminfo') if l.startswith('MemTotal:'))
+except (OSError, StopIteration, ValueError):
+    pages = 0
+orphans = max(65536, min(pages // 2, 262144)) if pages else 65536
+wanted = {
+    'net.core.somaxconn': ('max', [16384]),
+    'net.ipv4.tcp_max_syn_backlog': ('max', [16384]),
+    'net.core.netdev_max_backlog': ('max', [16384]),
+    'net.ipv4.tcp_max_orphans': ('max', [orphans]),
+    # FIN, не подтверждённый ушедшим клиентом, не должен висеть минутами.
+    'net.ipv4.tcp_orphan_retries': ('low', [3]),
+    'net.ipv4.tcp_fin_timeout': ('low', [15]),
+    'net.ipv4.tcp_tw_reuse': ('set', [2]),
+}
+if pages:
+    wanted['net.ipv4.tcp_mem'] = ('max', [pages // 16, pages // 8, pages // 4])
+lines = []
+for key, (mode, target) in wanted.items():
+    current = read(key)
+    if current is None:
+        continue
+    try:
+        current = [int(v) for v in current]
+    except ValueError:
+        continue
+    if len(current) != len(target):
+        continue
+    if mode == 'max':
+        value = [max(c, t) for c, t in zip(current, target)]
+    elif mode == 'low':
+        # 0 means "kernel default" for orphan_retries; any smaller positive wins.
+        value = [t if c == 0 or c > t else c for c, t in zip(current, target)]
+        if key == 'net.ipv4.tcp_fin_timeout':
+            value = [min(c, t) for c, t in zip(current, target)]
+    else:
+        value = target if current[0] == 0 else current
+    lines.append('%s = %s' % (key, ' '.join(str(v) for v in value)))
+Path(sys.argv[1]).write_text(
+    '# Managed by the mtdd installer; values are only ever raised.\n' + '\n'.join(lines) + '\n')
+PY
+    then
+        warn 'Не удалось подготовить параметры ядра; продолжаю без них'
+        return 0
+    fi
+    chmod 0644 "$conf"
+    # Контейнеры и песочницы часто запрещают запись в sysctl: это не ошибка.
+    if ! sysctl -q -p "$conf" >/dev/null 2>&1; then
+        warn 'Часть параметров ядра применить не удалось (контейнер или ограничения хоста)'
+    fi
 }
 
 # ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ void Runtime::Impl::connect_me(MeConn& me, Time now) {
         if (const auto found = me_pool_.find(me.dc); found != me_pool_.end()) {
             ++found->second.creation_failures_total;
         }
-        stats_.me_request(me.dc, control::MeResult::failure);
+        stats_.me_request(worker_index_, me.dc, control::MeResult::failure);
         ++me.candidate;
         // Refreshes the per-reactor pool gauge and the connected flag in one
         // place (publish_me_pool owns the readiness transition).
@@ -318,7 +318,14 @@ void Runtime::Impl::read_me(MeConn& me, Time now) {
         // socket. Without this an incomplete frame could grow past the hard
         // envelope. Pausing is preferable to failing the shared session.
         if (!budget_allows(limit + detail::kBudgetHeadroom / 2)) {
-            me.budget_paused = true;
+            // Count only the false -> true transition: level-triggered retries
+            // never reach here while paused, and a per-read counter would turn
+            // an exhausted worker into a high-rate counter stream.
+            if (!me.budget_paused) {
+                me.budget_paused = true;
+                me.budget_paused_at = now;
+                ++me.budget_pauses;
+            }
             break;
         }
         const ssize_t received = ::recv(me.fd.get(), read_buffer_.data(), limit, MSG_DONTWAIT);
@@ -338,7 +345,7 @@ void Runtime::Impl::read_me(MeConn& me, Time now) {
                 return;
             }
             if (status == protocol::Status::ProtocolError || status == protocol::Status::Closed) {
-                stats_.me_request(me.dc, control::MeResult::failure);
+                stats_.me_request(worker_index_, me.dc, control::MeResult::failure);
                 fail_me(me, now);
                 return;
             }

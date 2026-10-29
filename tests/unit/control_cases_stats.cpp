@@ -438,6 +438,159 @@ TEST(StatisticsTest, MePoolAndKeepaliveAggregateAcrossReactors) {
       << "the pool gauge is owned by publish_me_pool, not by me_connected";
 }
 
+// Per-worker diagnostics must stay attributable to one reactor: the historical
+// aggregate fields keep their summed meaning, and a locally exhausted worker is
+// visible even when the other worker has slack.
+TEST(StatisticsTest, WorkerDiagnosticsArePerWorkerNotSummed) {
+  Statistics stats;
+  stats.configure_workers(2);
+
+  stats.set_worker_diagnostics(0, 64'000'000, 64U * 1024U * 1024U, 41, 3);
+  stats.set_worker_diagnostics(1, 1'000'000, 64U * 1024U * 1024U, 7, 1);
+
+  const auto snapshot = stats.snapshot();
+  ASSERT_EQ(snapshot.workers.size(), 2u);
+  EXPECT_EQ(snapshot.workers[0].budget_used_bytes, 64'000'000u);
+  EXPECT_EQ(snapshot.workers[0].budget_limit_bytes, 64U * 1024U * 1024U);
+  EXPECT_EQ(snapshot.workers[0].active_clients, 41u);
+  EXPECT_EQ(snapshot.workers[0].handshakes_pending, 3u);
+  EXPECT_EQ(snapshot.workers[1].budget_used_bytes, 1'000'000u);
+  EXPECT_EQ(snapshot.workers[1].active_clients, 7u);
+  // Backward compatibility: the existing aggregate is still the sum of the
+  // per-worker gauges, not a second statistics system.
+  EXPECT_EQ(snapshot.buffer_budget_used,
+            snapshot.workers[0].budget_used_bytes +
+                snapshot.workers[1].budget_used_bytes);
+  EXPECT_EQ(snapshot.handshakes_pending, 4u);
+
+  const std::string text = stats.prometheus_text();
+  EXPECT_NE(text.find("mtdd_worker_budget_used_bytes{worker=\"0\"} 64000000\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_budget_used_bytes{worker=\"1\"} 1000000\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_budget_limit_bytes{worker=\"0\"} 67108864\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_active_clients{worker=\"0\"} 41\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_active_clients{worker=\"1\"} 7\n"),
+            std::string::npos);
+  // The legacy aggregate remains unchanged and unlabelled.
+  EXPECT_NE(text.find("mtdd_buffer_budget_bytes 65000000\n"),
+            std::string::npos);
+}
+
+TEST(StatisticsTest, MeWorkerDiagnosticsUseFixedWorkerAndDcLabels) {
+  Statistics stats;
+  stats.configure_workers(2);
+
+  MeWorkerSnapshot worker0;
+  worker0.connections = 6;
+  worker0.ready_connections = 5;
+  worker0.read_armed_connections = 3;
+  worker0.budget_paused_connections = 2;
+  worker0.bound_clients_on_paused = 11;
+  worker0.budget_pauses_total = 7;
+  worker0.budget_resumes_total = 6;
+  worker0.current_pause_age_ms = 400;
+  worker0.max_pause_age_ms = 900;
+  stats.me_worker(0, 2, worker0);
+
+  MeWorkerSnapshot worker1 = worker0;
+  worker1.connections = 1;
+  worker1.ready_connections = 1;
+  worker1.read_armed_connections = 1;
+  worker1.budget_paused_connections = 0;
+  worker1.bound_clients_on_paused = 0;
+  worker1.budget_pauses_total = 1;
+  worker1.budget_resumes_total = 1;
+  worker1.current_pause_age_ms = 0;
+  worker1.max_pause_age_ms = 120;
+  stats.me_worker(1, 2, worker1);
+  // Any non-contract DC is aggregated under the fixed "other" label.
+  stats.me_worker(0, 9999, worker0);
+
+  const auto snapshot = stats.snapshot();
+  ASSERT_EQ(snapshot.workers.size(), 2u);
+  const auto& first = snapshot.workers[0].me_dcs.at("2");
+  EXPECT_EQ(first.connections, 6u);
+  EXPECT_EQ(first.read_armed_connections, 3u);
+  EXPECT_EQ(first.budget_paused_connections, 2u);
+  EXPECT_EQ(first.bound_clients_on_paused, 11u);
+  EXPECT_EQ(first.budget_pauses_total, 7u);
+  EXPECT_EQ(first.budget_resumes_total, 6u);
+  EXPECT_EQ(first.current_pause_age_ms, 400u);
+  EXPECT_EQ(first.max_pause_age_ms, 900u);
+  const auto& second = snapshot.workers[1].me_dcs.at("2");
+  EXPECT_EQ(second.budget_paused_connections, 0u);
+  EXPECT_EQ(second.read_armed_connections, 1u);
+  // The aggregate ME series is untouched: worker diagnostics are not summed
+  // into it, and labels remain bounded.
+  EXPECT_EQ(snapshot.me_dcs.at("2").bound_clients, 0u);
+  EXPECT_LE(snapshot.workers[0].me_dcs.size(), 13u);
+  EXPECT_EQ(snapshot.workers[0].me_dcs.count("9999"), 0u);
+  ASSERT_EQ(snapshot.workers[0].me_dcs.count("other"), 1u);
+
+  const std::string text = stats.prometheus_text();
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_budget_paused{worker=\"0\",dc=\"2\"} 2\n"),
+            std::string::npos);
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_paused_bound_clients{worker=\"0\",dc=\"2\"} 11\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_me_read_armed{worker=\"0\",dc=\"2\"} 3\n"),
+            std::string::npos);
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_budget_pauses_total{worker=\"0\",dc=\"2\"} 7\n"),
+            std::string::npos);
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_budget_resumes_total{worker=\"0\",dc=\"2\"} 6\n"),
+            std::string::npos);
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_pause_current_ms{worker=\"0\",dc=\"2\"} 400\n"),
+            std::string::npos);
+  EXPECT_NE(text.find(
+                "mtdd_worker_me_pause_max_ms{worker=\"0\",dc=\"2\"} 900\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_me_read_armed{worker=\"1\",dc=\"2\"} 1\n"),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_me_ready{worker=\"1\",dc=\"2\"} 1\n"),
+            std::string::npos);
+}
+
+TEST(StatisticsTest, WorkerHeartbeatAndHousekeepingLatenessExposeStaleness) {
+  Statistics stats;
+  stats.configure_workers(2);
+  const auto now_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+  stats.set_worker_heartbeat_at(0, now_ns - 1'500'000'000ULL);
+  stats.set_worker_heartbeat_at(1, now_ns);
+  stats.set_worker_housekeeping_lateness(0, 12, 34);
+  stats.set_worker_housekeeping_lateness(1, 0, 3);
+
+  const auto snapshot = stats.snapshot();
+  ASSERT_EQ(snapshot.workers.size(), 2u);
+  EXPECT_TRUE(snapshot.workers[0].heartbeat_seen);
+  EXPECT_GE(snapshot.workers[0].heartbeat_age_ms, 1'500u);
+  EXPECT_TRUE(snapshot.workers[1].heartbeat_seen);
+  EXPECT_LT(snapshot.workers[1].heartbeat_age_ms, 10'000u);
+  EXPECT_EQ(snapshot.workers[0].housekeeping_lateness_ms, 12u);
+  EXPECT_EQ(snapshot.workers[0].housekeeping_lateness_max_ms, 34u);
+  EXPECT_EQ(snapshot.workers[1].housekeeping_lateness_max_ms, 3u);
+
+  const std::string text = stats.prometheus_text();
+  EXPECT_NE(text.find("mtdd_worker_heartbeat_age_ms{worker=\"0\"} "),
+            std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_housekeeping_lateness_ms{worker=\"0\"} 12\n"),
+            std::string::npos);
+  EXPECT_NE(
+      text.find("mtdd_worker_housekeeping_lateness_max_ms{worker=\"0\"} 34\n"),
+      std::string::npos);
+  EXPECT_NE(text.find("mtdd_worker_housekeeping_lateness_ms{worker=\"1\"} 0\n"),
+            std::string::npos);
+}
+
 
 }  // namespace
 

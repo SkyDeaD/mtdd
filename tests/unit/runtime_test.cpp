@@ -2,6 +2,16 @@
 
 namespace {
 
+// The reactor batches readiness and accepts in fixed, stack-safe arrays. The
+// sizes are part of the overload contract: too small starves a busy reactor,
+// while an unbounded batch would let one event monopolise the worker.
+TEST(Runtime, EpollAndAcceptBatchesStayBoundedAndLargeEnough) {
+    EXPECT_EQ(mtdd::detail::kEpollBatch, 512U);
+    EXPECT_LE(sizeof(std::array<epoll_event, mtdd::detail::kEpollBatch>),
+              std::size_t{64} * 1024U);
+    EXPECT_EQ(mtdd::detail::kAcceptBatch, 128U);
+}
+
 TEST(Runtime, BindsAndStops) {
     Daemon daemon(1, false);
     ASSERT_NE(daemon.port(), 0);
@@ -88,19 +98,23 @@ TEST(Runtime, ZeroConnectionAndHandshakeLimitsAreUnlimited) {
     ::close(second);
 }
 
-TEST(Runtime, GlobalBufferAdmissionLimitRejectsNewClients) {
+TEST(Runtime, GlobalBufferAdmissionLimitPausesListenerWithoutAccepting) {
     Daemon daemon(1, false, [](mtdd::Config& config) {
         config.connection_queue_bytes = 4096;
         config.max_frame_bytes = 4096;
+        // Below make_client()'s admission reservation (headroom + 8 KiB), so the
+        // reactor must never accept: accepting and closing would strand an
+        // orphan socket per attempt.
         config.global_buffer_bytes = 100U * 1024U;
     });
     ASSERT_TRUE(daemon.services.add_user("alice", std::string(kSecretHex)));
     const int fd = connect_loopback(daemon.port());
     ASSERT_GE(fd, 0);
-    EXPECT_TRUE(wait_closed(fd, 3000));
-    EXPECT_TRUE(wait_for(
-        [&] { return stat_counter(daemon.services.stats, "rejected", "overload") >= 1U; }, 2s));
+    // The kernel completes the handshake into the listen backlog, but the
+    // listener stays paused: no FIN, no overload rejection, no active client.
+    EXPECT_FALSE(wait_closed(fd, 500));
     EXPECT_EQ(daemon.services.stats.snapshot().connections_active, 0U);
+    EXPECT_EQ(stat_counter(daemon.services.stats, "rejected", "overload"), 0U);
     ::close(fd);
 }
 
@@ -382,6 +396,29 @@ TEST(Runtime, SharedMiddleEndSurvivesOneLogicalClientClose) {
     ASSERT_NE(found, snapshot.me_dcs.end());
     EXPECT_TRUE(found->second.connected);
     EXPECT_EQ(snapshot.connections_active, 1U);
+}
+
+TEST(Runtime, MeWriterLimitsAcceptConfiguredMaximum) {
+    Services services(1, false, [](mtdd::Config& config) {
+        config.me_connections_per_dc = 24;
+        config.me_clients_per_writer = 400;
+    });
+    EXPECT_NO_THROW({
+        mtdd::Runtime runtime(services.config, *services.store, services.stats,
+                              *services.metadata, services.barrier);
+    });
+    // 2 * 24 = 48 pool slots per DC stay below the reactor's 63-writer cap.
+    EXPECT_LE(2U * services.config.me_connections_per_dc, 63U);
+
+    Services invalid(1, false, [](mtdd::Config& config) {
+        config.me_connections_per_dc = 25;
+    });
+    EXPECT_THROW(
+        {
+            mtdd::Runtime runtime(invalid.config, *invalid.store, invalid.stats,
+                                  *invalid.metadata, invalid.barrier);
+        },
+        std::invalid_argument);
 }
 
 TEST(Runtime, DestructorWaitsForConcurrentReactor) {

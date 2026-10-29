@@ -130,13 +130,18 @@ void Runtime::Impl::release_client_pool() noexcept {
 }
 
 void Runtime::Impl::accept_clients(Time now) {
-    for (int iteration = 0; iteration < 32; ++iteration) {
+    for (std::size_t iteration = 0; iteration < detail::kAcceptBatch; ++iteration) {
         if (config_.max_connections != 0 &&
             (clients_.size() >= static_cast<std::size_t>(config_.max_connections) ||
              shared_->connections.load(std::memory_order_relaxed) >=
                  config_.max_connections)) {
             break;
         }
+        // Do not accept a socket that make_client() would immediately reject
+        // for lack of budget. Accept-then-close churn under a rejection storm
+        // creates orphan sockets; leaving the connection in the listen backlog
+        // is bounded by the listener backlog.
+        if (!budget_allows(detail::kBudgetHeadroom + 8192)) break;
         sockaddr_storage address{};
         socklen_t length = sizeof(address);
         const int fd = ::accept4(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length,
@@ -302,7 +307,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
-    if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
+    if (!budget_allows(detail::kClientReadReservation)) {
         client.budget_paused = true;
         paused_clients_.push_back(client.token);
         stats_.add_backpressure(control::Direction::client_to_server);

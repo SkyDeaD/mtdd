@@ -141,7 +141,7 @@ class InstallerTest(unittest.TestCase):
         (self.branch / "mtdd-linux-x86_64").write_bytes(binary)
         self.checksum(hashlib.sha256(binary).hexdigest())
         sandbox = self.root / "interactive"
-        for name in ("etc", "varlib", "bin", "run/systemd/system", "commands"):
+        for name in ("etc", "etc/sysctl.d", "varlib", "bin", "run/systemd/system", "commands"):
             (sandbox / name).mkdir(parents=True)
         (sandbox / "etc/passwd").write_text(
             "root:x:0:0:root:/root:/bin/sh\nmtdd:x:0:0:mtdd:/var/lib/mtdd:/usr/sbin/nologin\n")
@@ -188,7 +188,7 @@ printf 'dev\nexample.org\n00112233445566778899aabbccddeeff\n14443\nalice\n' |
         (self.branch / "mtdd-linux-x86_64").write_bytes(binary)
         self.checksum(hashlib.sha256(binary).hexdigest())
         sandbox = self.root / "sandbox"
-        for name in ("etc", "varlib", "bin", "run/systemd/system", "commands"):
+        for name in ("etc", "etc/sysctl.d", "varlib", "bin", "run/systemd/system", "commands"):
             (sandbox / name).mkdir(parents=True)
         (sandbox / "etc/passwd").write_text(
             "root:x:0:0:root:/root:/bin/sh\nmtdd:x:0:0:mtdd:/var/lib/mtdd:/usr/sbin/nologin\n"
@@ -217,7 +217,7 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --public-host proxy.example.org --public-port 443
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL" --domain ignored.example --port 14444
-python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; open(p,"w").write(json.dumps(d))'
+python3 -c 'import json; p="/etc/mtdd/config.json"; d=json.load(open(p)); del d["public_host"]; d["me_connections_per_dc"]=20; open(p,"w").write(json.dumps(d))'
 bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
   --base-url "$MTDD_TEST_URL"
 '''
@@ -241,6 +241,16 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
         self.assertNotIn("\x1b[", result.stdout)
         self.assertEqual((sandbox / "etc/mtdd/credentials.env").stat().st_mode & 0o777, 0o600)
         self.assertTrue((sandbox / "etc/systemd/system/mtdd.service").exists())
+        # Capacity defaults: filled when absent, never overriding an operator.
+        self.assertGreaterEqual(config["global_buffer_bytes"], 64 << 20)
+        self.assertLessEqual(config["global_buffer_bytes"], 1 << 30)
+        self.assertEqual(config["me_connections_per_dc"], 20,
+                         "an operator's explicit value must survive the update")
+        unit = (sandbox / "etc/systemd/system/mtdd.service").read_text()
+        self.assertIn("LimitNOFILE=1048576", unit)
+        sysctl = (sandbox / "etc/sysctl.d/99-mtdd-load.conf").read_text()
+        self.assertIn("net.core.somaxconn = ", sysctl)
+        self.assertIn("net.ipv4.tcp_orphan_retries = ", sysctl)
         bad_candidate = b"#!/bin/sh\nexit 1\n"
         (self.branch / "mtdd-linux-x86_64").write_bytes(bad_candidate)
         self.checksum(hashlib.sha256(bad_candidate).hexdigest())
@@ -259,7 +269,7 @@ bash "$MTDD_TEST_INSTALLER" --repo example/mtdd --branch dev \
         (self.branch / "mtdd-linux-x86_64").write_bytes(binary)
         self.checksum(hashlib.sha256(binary).hexdigest())
         sandbox = self.root / "manage"
-        for name in ("etc", "varlib", "bin", "run/systemd/system", "commands"):
+        for name in ("etc", "etc/sysctl.d", "varlib", "bin", "run/systemd/system", "commands"):
             (sandbox / name).mkdir(parents=True)
         (sandbox / "etc/passwd").write_text(
             "root:x:0:0:root:/root:/bin/sh\nmtdd:x:0:0:mtdd:/var/lib/mtdd:/usr/sbin/nologin\n")
