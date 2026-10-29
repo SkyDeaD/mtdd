@@ -361,5 +361,178 @@ printf '0\n' | script -q -e -c 'bash "$MTDD_TEST_INSTALLER" menu' /dev/null
         self.assertNotIn("\x1b[", result.stdout)
 
 
+class LauncherTest(unittest.TestCase):
+    """Launcher (mtdd-ctl) and credentials logic, tested without root or systemd."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.ctl = self.bin / "mtdd-ctl"
+        # Copy of the installer whose launcher path points into the temp dir.
+        self.script = self.root / "install-copy.sh"
+        self.script.write_text(INSTALLER.read_text().replace(
+            "/usr/local/bin/mtdd-ctl", str(self.ctl)))
+        www = self.root / "www"
+        www.mkdir()
+        self.www = www
+        handler = lambda *a, **k: QuietHandler(*a, directory=str(www), **k)  # noqa: E731
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/install.sh"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def sh(self, body, script=None, pipe=False, **env):
+        full = os.environ.copy()
+        full.update(MTDD_INSTALLER_SOURCE_ONLY="1", **env)
+        path = script or self.script
+        src = f'<(cat "{path}")' if pipe else f'"{path}"'
+        prog = (f'set -Eeuo pipefail; source {src}; '
+                "ensure_sudo_visibility() { :; }; " + body)
+        return subprocess.run(["bash", "-c", prog], text=True, capture_output=True,
+                              env=full, timeout=60)
+
+    def test_launcher_url_follows_channel_and_repo(self):
+        for channel in ("main", "dev"):
+            r = self.sh(f'repo=a/b channel={channel}; launcher_source_url')
+            self.assertEqual(r.stdout, f"https://raw.githubusercontent.com/a/b/{channel}/install.sh")
+        r = self.sh('repo=a/b channel=dev; launcher_manual_command')
+        self.assertIn("sudo curl -fsSLo", r.stdout)
+        self.assertIn("a/b/dev/install.sh", r.stdout)
+        self.assertIn("chmod 755", r.stdout)
+
+    def test_fetch_validates_shebang_and_marker(self):
+        dest = self.root / "fetched"
+        (self.www / "install.sh").write_text("#!/usr/bin/env bash\n# install_launcher_copy\n")
+        r = self.sh(f'fetch_launcher_source "{dest}"', MTDD_LAUNCHER_URL=self.url)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(dest.exists())
+        (self.www / "install.sh").write_text("#!/usr/bin/env bash\necho unrelated\n")
+        r = self.sh(f'fetch_launcher_source "{dest}"', MTDD_LAUNCHER_URL=self.url)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(dest.exists())
+        (self.www / "install.sh").write_text("<html>install_launcher_copy</html>\n")
+        r = self.sh(f'fetch_launcher_source "{dest}"', MTDD_LAUNCHER_URL=self.url)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_installs_regular_file_atomically(self):
+        self.ctl.write_text("old")
+        old_inode = self.ctl.stat().st_ino
+        r = self.sh(f'work="{self.root}"; launcher_installed=0; install_launcher_copy; '
+                    'echo "flag=$launcher_installed"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("flag=1", r.stdout)
+        self.assertEqual(self.ctl.read_text(), self.script.read_text())
+        self.assertEqual(self.ctl.stat().st_mode & 0o777, 0o755)
+        self.assertNotEqual(self.ctl.stat().st_ino, old_inode)
+        self.assertEqual([p.name for p in self.bin.iterdir()], ["mtdd-ctl"])
+
+    def test_update_from_launcher_refreshes_it(self):
+        shutil.copy(self.script, self.ctl)
+        self.ctl.chmod(0o755)
+        fresh = "#!/usr/bin/env bash\n# install_launcher_copy fresh\n"
+        (self.www / "install.sh").write_text(fresh)
+        r = self.sh(f'work="{self.root}"; launcher_installed=0; install_launcher_copy; '
+                    'echo "flag=$launcher_installed"', script=self.ctl,
+                    MTDD_LAUNCHER_URL=self.url)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ctl.read_text(), fresh)
+        self.assertEqual(self.ctl.stat().st_mode & 0o777, 0o755)
+        self.assertIn("flag=1", r.stdout)
+
+    def test_failed_refresh_keeps_existing_launcher_and_warns(self):
+        shutil.copy(self.script, self.ctl)
+        self.ctl.chmod(0o755)
+        before = self.ctl.read_text()
+        (self.www / "install.sh").write_text("garbage\n")
+        r = self.sh(f'work="{self.root}"; launcher_installed=0; install_launcher_copy; '
+                    'echo "flag=$launcher_installed"', script=self.ctl,
+                    MTDD_LAUNCHER_URL=self.url)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.ctl.read_text(), before)
+        self.assertIn("flag=1", r.stdout)
+        self.assertIn("sudo curl -fsSLo", r.stdout)
+
+    def test_pipe_mode_failure_prints_manual_command(self):
+        (self.www / "install.sh").write_text("garbage\n")
+        r = self.sh(f'work="{self.root}"; launcher_installed=0; repo=x/y channel=dev; '
+                    'install_launcher_copy; echo "flag=$launcher_installed"',
+                    pipe=True, MTDD_LAUNCHER_URL=self.url)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("НЕ УСТАНОВЛЕН", r.stdout)
+        self.assertIn("x/y/dev/install.sh", r.stdout)
+        self.assertIn("flag=0", r.stdout)
+        self.assertFalse(self.ctl.exists())
+
+    def test_path_has_dir(self):
+        ok = self.sh('path_has_dir /sbin:/usr/local/bin:/bin /usr/local/bin')
+        self.assertEqual(ok.returncode, 0)
+        no = self.sh('path_has_dir /sbin:/bin:/usr/sbin /usr/local/bin')
+        self.assertEqual(no.returncode, 1)
+        no = self.sh('path_has_dir /usr/local/binx /usr/local/bin')
+        self.assertEqual(no.returncode, 1)
+
+    def test_launcher_installed_before_service_start(self):
+        text = INSTALLER.read_text()
+        body = text[text.index("\nrun_install() {"):]
+        self.assertLess(body.index("install_launcher_copy"),
+                        body.index('systemctl enable --now "$MTDD_SERVICE"'))
+        self.assertLess(body.index("install_launcher_copy"), body.index("install -m 0644 /dev/stdin"))
+        self.assertEqual(body.count("install_launcher_copy"), 1)
+
+    def test_uninstall_removes_symlink_helper(self):
+        text = INSTALLER.read_text()
+        uninstall = text[text.index("cmd_uninstall() {"):]
+        self.assertLess(uninstall.index("remove_ctl_links"), uninstall.index('rm -f -- "$MTDD_BIN"'))
+
+    def test_fresh_install_generates_three_tokens(self):
+        text = INSTALLER.read_text()
+        for name in ("MTDD_API_TOKEN", "MTDD_API_READ_TOKEN", "MTDD_METRICS_TOKEN"):
+            self.assertIn(f"'{name}'", text)
+        self.assertIn("secrets.token_hex(32)", text)
+
+    def test_config_references_scoped_tokens_with_old_binary_fallback(self):
+        text = INSTALLER.read_text()
+        body = text[text.index("\nrun_install() {"):]
+        self.assertIn("for scoped in 1 0; do", body)
+        self.assertIn("'api_read_token_env': 'MTDD_API_READ_TOKEN'", body)
+        self.assertIn("'metrics_token_env': 'MTDD_METRICS_TOKEN'", body)
+        self.assertLess(body.index("for scoped in 1 0; do"), body.index('mv -f -- "$config_candidate" "$MTDD_CONF"'))
+
+    def update_snippet(self):
+        text = INSTALLER.read_text()
+        start = text.index("python3 - \"$MTDD_CREDS\" <<'PY'\n") + len("python3 - \"$MTDD_CREDS\" <<'PY'\n")
+        return text[start:text.index("\nPY\n", start)]
+
+    def test_update_appends_only_missing_tokens_and_keeps_mode(self):
+        creds = self.root / "credentials.env"
+        creds.write_text("MTDD_API_TOKEN=" + "a" * 64)  # no trailing newline
+        creds.chmod(0o600)
+        ino = creds.stat().st_ino
+        for _ in range(2):
+            subprocess.run(["python3", "-c", self.update_snippet(), str(creds)], check=True)
+        lines = creds.read_text().splitlines()
+        self.assertEqual(lines[0], "MTDD_API_TOKEN=" + "a" * 64)
+        values = dict(line.split("=", 1) for line in lines)
+        self.assertEqual(set(values), {"MTDD_API_TOKEN", "MTDD_API_READ_TOKEN", "MTDD_METRICS_TOKEN"})
+        self.assertEqual(len(lines), 3)
+        for name in ("MTDD_API_READ_TOKEN", "MTDD_METRICS_TOKEN"):
+            self.assertRegex(values[name], r"^[A-Za-z0-9]{32,512}$")
+        self.assertEqual(creds.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(creds.stat().st_ino, ino)
+
+    def test_update_preserves_existing_new_tokens(self):
+        creds = self.root / "credentials.env"
+        creds.write_text("MTDD_API_TOKEN=x\nMTDD_API_READ_TOKEN=r\nMTDD_METRICS_TOKEN=m\n")
+        subprocess.run(["python3", "-c", self.update_snippet(), str(creds)], check=True)
+        self.assertEqual(creds.read_text(), "MTDD_API_TOKEN=x\nMTDD_API_READ_TOKEN=r\nMTDD_METRICS_TOKEN=m\n")
+
+
+
 if __name__ == "__main__":
     unittest.main()

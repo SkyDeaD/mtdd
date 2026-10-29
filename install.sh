@@ -1409,6 +1409,7 @@ cmd_uninstall() {
     systemctl disable --now "$MTDD_SERVICE" 2>/dev/null || warn 'Служба уже неактивна или отсутствует'
     rm -f -- "$MTDD_UNIT"
     systemctl daemon-reload 2>/dev/null || true
+    remove_ctl_links
     rm -f -- "$MTDD_BIN" "$MTDD_CTL"
     ok 'Служба, бинарник и менеджер mtdd-ctl удалены'
     local remove_state=0
@@ -1623,34 +1624,143 @@ for user in users:
 PY
 }
 
+# URL установщика для mtdd-ctl: ветка совпадает с выбранным каналом (main|dev).
+# MTDD_LAUNCHER_URL — только для тестов.
+launcher_source_url() {
+    printf '%s' "${MTDD_LAUNCHER_URL:-https://raw.githubusercontent.com/$repo/$channel/install.sh}"
+}
+
+# Команда для ручной установки менеджера, если автоматическая не удалась.
+launcher_manual_command() {
+    printf 'sudo curl -fsSLo %s https://raw.githubusercontent.com/%s/%s/install.sh && sudo chmod 755 %s' \
+        "$MTDD_CTL" "$repo" "$channel" "$MTDD_CTL"
+}
+
+# Файл похож на наш установщик: shebang и функция установки менеджера.
+launcher_source_valid() {
+    [[ -s $1 ]] && head -n 1 -- "$1" | grep -q '^#!/usr/bin/env bash' \
+        && grep -q 'install_launcher_copy' "$1"
+}
+
+# fetch_launcher_source ПУТЬ: скачать установщик канала (3 попытки) и проверить его.
+fetch_launcher_source() {
+    local dest=$1 url
+    url=$(launcher_source_url)
+    for _ in 1 2 3; do
+        if curl -fsSL --connect-timeout 20 -o "$dest" "$url" && launcher_source_valid "$dest"; then
+            return 0
+        fi
+        sleep 1
+    done
+    rm -f -- "$dest"
+    return 1
+}
+
+# Атомарная установка менеджера: временный файл в том же каталоге + mv -f,
+# чтобы не портить запущенный скрипт (bash читает его постепенно).
+install_launcher_file() {
+    local src=$1 tmp
+    tmp=$(mktemp "$(dirname -- "$MTDD_CTL")/.mtdd-ctl.XXXXXXXX") || return 1
+    if install -m 0755 -- "$src" "$tmp" && chmod 0755 -- "$tmp" && mv -f -- "$tmp" "$MTDD_CTL"; then
+        return 0
+    fi
+    rm -f -- "$tmp"
+    return 1
+}
+
+# secure_path из sudo (пусто, если определить не удалось).
+sudo_secure_path() {
+    local value=
+    if command -v sudo >/dev/null 2>&1; then
+        value=$(sudo -V 2>/dev/null | sed -n "s/^[[:space:]]*Value to override user's \$PATH with:[[:space:]]*//p" | head -n 1 || true)
+    fi
+    if [[ -z $value ]]; then
+        value=$(cat /etc/sudoers /etc/sudoers.d/* 2>/dev/null \
+            | sed -n 's/^[[:space:]]*Defaults.*secure_path[[:space:]]*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}.*/\1/p' \
+            | head -n 1 || true)
+    fi
+    printf '%s' "$value"
+}
+
+path_has_dir() { # path_has_dir СПИСОК_ЧЕРЕЗ_ДВОЕТОЧИЕ КАТАЛОГ
+    case ":$1:" in *":$2:"*) return 0 ;; *) return 1 ;; esac
+}
+
+# Если /usr/local/bin нет в secure_path sudo (RHEL/Alma/Rocky/CentOS/Fedora),
+# делаем симлинк, чтобы работало `sudo mtdd-ctl`.
+ensure_sudo_visibility() {
+    local sp link_dir=/usr/sbin link
+    sp=$(sudo_secure_path)
+    if [[ -n $sp ]]; then
+        path_has_dir "$sp" /usr/local/bin && return 0
+        if ! path_has_dir "$sp" /usr/sbin && path_has_dir "$sp" /usr/bin; then link_dir=/usr/bin; fi
+    fi
+    [[ -d $link_dir ]] || return 0
+    link=$link_dir/mtdd-ctl
+    if [[ -L $link && $(readlink -- "$link") == "$MTDD_CTL" ]]; then
+        return 0
+    fi
+    if [[ -e $link || -L $link ]]; then
+        warn "$link уже существует и не наш; sudo mtdd-ctl может не найтись, используйте sudo $MTDD_CTL"
+        return 0
+    fi
+    if ln -s -- "$MTDD_CTL" "$link"; then
+        ok "secure_path sudo без /usr/local/bin: создана ссылка $link"
+    else
+        warn "Не удалось создать ссылку $link; используйте sudo $MTDD_CTL"
+    fi
+}
+
+remove_ctl_links() {
+    local link
+    for link in /usr/sbin/mtdd-ctl /usr/bin/mtdd-ctl; do
+        if [[ -L $link && $(readlink -- "$link") == "$MTDD_CTL" ]]; then rm -f -- "$link"; fi
+    done
+}
+
+# Итоговая проверка: находит ли `sudo mtdd-ctl` менеджер при secure_path.
+verify_launcher_resolves() {
+    local sp
+    sp=$(sudo_secure_path)
+    [[ -n $sp ]] || sp=/sbin:/bin:/usr/sbin:/usr/bin
+    if env -i PATH="$sp" bash -c 'command -v mtdd-ctl' >/dev/null 2>&1; then
+        return 0
+    fi
+    warn "'sudo mtdd-ctl' не найдёт команду (secure_path: $sp)"
+    warn "Используйте абсолютный путь: sudo $MTDD_CTL"
+    return 1
+}
+
 install_launcher_copy() {
     local src=${BASH_SOURCE[0]:-}
-    if [[ -z $src || $src == /dev/stdin || $src == /dev/fd/* || ! -f $src ]]; then
-        # Pipe mode: the script is a stream, so fetch the canonical installer
-        # for the same repository and install that copy as the manager.
-        local self_url="https://raw.githubusercontent.com/$repo/main/install.sh"
-        local self_copy="$work/mtdd-ctl.src"
-        if curl -fsSL --retry 3 --connect-timeout 20 -o "$self_copy" "$self_url" \
-            && [[ -s $self_copy ]] && grep -q '^#!/usr/bin/env bash' "$self_copy"; then
-            src="$self_copy"
-            ok 'Копия установщика получена из репозитория'
+    local self_copy="$work/mtdd-ctl.src"
+    if [[ -z $src || $src == /dev/stdin || $src == /dev/fd/* || ! -f $src ]] || [[ $src -ef $MTDD_CTL ]]; then
+        # Конвейер или запуск самого mtdd-ctl: берём свежий установщик нужного канала.
+        if fetch_launcher_source "$self_copy"; then
+            src=$self_copy
+            ok "Копия установщика получена из репозитория (канал $channel)"
         else
-            warn 'Не удалось получить установщик для mtdd-ctl; управляйте этим же скриптом'
-            warn 'Скачайте install.sh на сервер и запустите его из файла'
+            if [[ -x $MTDD_CTL ]]; then
+                launcher_installed=1
+                warn "Не удалось обновить mtdd-ctl, оставлена прежняя версия ($MTDD_CTL)"
+                warn "Обновить вручную: $(launcher_manual_command)"
+                ensure_sudo_visibility
+                return 0
+            fi
+            warn '!!! mtdd-ctl НЕ УСТАНОВЛЕН: не удалось скачать install.sh из репозитория'
+            warn "!!! Установите менеджер вручную: $(launcher_manual_command)"
             return 0
         fi
     fi
-    if [[ $src -ef $MTDD_CTL ]]; then
-        launcher_installed=1
-        ok "Менеджер управления уже установлен: sudo mtdd-ctl"
-        return 0
-    fi
-    if install -m 0755 "$src" "$MTDD_CTL"; then
+    if install_launcher_file "$src"; then
         launcher_installed=1
         ok "Менеджер управления: sudo mtdd-ctl ($MTDD_CTL)"
     else
         warn 'Не удалось установить mtdd-ctl; управление доступно через этот же скрипт'
+        warn "Установите вручную: $(launcher_manual_command)"
+        return 0
     fi
+    ensure_sudo_visibility
 }
 
 download_and_stage() {
@@ -1745,6 +1855,9 @@ run_install() {
     step "Публичный адрес для ссылок: $public_host${public_port:+:$public_port}"
 
     download_and_stage
+    # Менеджер ставим сразу после проверки бинарника: сбой запуска службы ниже
+    # (set -e) не должен оставить сервер без mtdd-ctl.
+    install_launcher_copy
 
     if ! getent passwd mtdd >/dev/null; then
         useradd --system --user-group --home-dir "$MTDD_STATE" --shell /usr/sbin/nologin mtdd
@@ -1770,7 +1883,9 @@ if os.environ["MTDD_PUBLIC_PORT"]:
 users = {"version": 1, "revision": 1, "users": [{"name": os.environ["MTDD_INSTALL_USER"],
          "secret": secrets.token_hex(16), "enabled": True, "max_connections": None, "generation": 1}]}
 Path('/etc/mtdd/config.json').write_text(json.dumps(config, indent=2) + '\n')
-Path('/etc/mtdd/credentials.env').write_text('MTDD_API_TOKEN=' + secrets.token_hex(32) + '\n')
+Path('/etc/mtdd/credentials.env').write_text(''.join(
+    f'{name}={secrets.token_hex(32)}\n'
+    for name in ('MTDD_API_TOKEN', 'MTDD_API_READ_TOKEN', 'MTDD_METRICS_TOKEN')))
 Path('/var/lib/mtdd/users.json').write_text(json.dumps(users, indent=2) + '\n')
 PY
         chown root:mtdd /etc/mtdd/config.json
@@ -1779,19 +1894,53 @@ PY
         chmod 0600 /etc/mtdd/credentials.env
         chown mtdd:mtdd "$MTDD_STATE/users.json"
         chmod 0600 "$MTDD_STATE/users.json"
+    else
+        # Обновление: дописываем недостающие токены, существующие значения не трогаем.
+        python3 - "$MTDD_CREDS" <<'PY'
+import re
+import secrets
+import sys
+
+path = sys.argv[1]
+with open(path, 'r+') as f:  # открытие на месте сохраняет владельца и режим файла
+    text = f.read()
+    add = ''
+    for name in ('MTDD_API_READ_TOKEN', 'MTDD_METRICS_TOKEN'):
+        if not re.search(r'^(export\s+)?' + name + r'=', text, re.M):
+            add += f'{name}={secrets.token_hex(32)}\n'
+    if add:
+        if text and not text.endswith('\n'):
+            add = '\n' + add
+        f.write(add)
+PY
     fi
     config_candidate=$(mktemp /etc/mtdd/.config.XXXXXXXX)
     trap 'rm -rf -- "$work"; rm -f -- "$staged" "$config_candidate"' EXIT
-    MTDD_PUBLIC_HOST=$public_host MTDD_PUBLIC_PORT=$public_port python3 - "$config_candidate" <<'PY'
+    # Отдельные токены read/metrics и порт метрик знает только новый бинарник:
+    # сначала пробуем конфиг с ними, при отказе (старый канал) — без них.
+    local scoped
+    for scoped in 1 0; do
+        MTDD_SCOPED_TOKENS=$scoped MTDD_PUBLIC_HOST=$public_host MTDD_PUBLIC_PORT=$public_port \
+            python3 - "$config_candidate" <<'PY'
 import json, os, sys
 from pathlib import Path
 config = json.loads(Path('/etc/mtdd/config.json').read_text())
 config['public_host'] = os.environ['MTDD_PUBLIC_HOST']
 if os.environ['MTDD_PUBLIC_PORT']:
     config['public_port'] = int(os.environ['MTDD_PUBLIC_PORT'])
+scoped = {'api_read_token_env': 'MTDD_API_READ_TOKEN', 'metrics_token_env': 'MTDD_METRICS_TOKEN'}
+if os.environ['MTDD_SCOPED_TOKENS'] == '1':
+    for key, value in scoped.items():
+        config.setdefault(key, value)
+else:
+    for key in scoped:
+        config.pop(key, None)
 Path(sys.argv[1]).write_text(json.dumps(config, indent=2) + '\n')
 PY
-    "$staged" --config "$config_candidate" --check-config >/dev/null || die 'Проверка конфигурации не пройдена'
+        if "$staged" --config "$config_candidate" --check-config >/dev/null 2>&1; then break; fi
+        ((scoped)) && continue
+        "$staged" --config "$config_candidate" --check-config >/dev/null || die 'Проверка конфигурации не пройдена'
+    done
     chown root:mtdd "$config_candidate"
     chmod 0640 "$config_candidate"
     mv -f -- "$config_candidate" "$MTDD_CONF"
@@ -1826,7 +1975,6 @@ EOF
     step 'Запускаю службу systemd…'
     systemctl enable --now "$MTDD_SERVICE"
     if ((!fresh)); then systemctl restart "$MTDD_SERVICE"; fi
-    install_launcher_copy
     section 'Готово · ссылки для Telegram'
     ok "Бинарник: $channel · служба: mtdd"
     warn 'Ссылки содержат секреты. Передавайте их только своим пользователям.'
@@ -1834,7 +1982,11 @@ EOF
     print_links_from_files
     printf '\n'
     if ((launcher_installed)); then
-        step 'Управление: sudo mtdd-ctl (меню)'
+        if verify_launcher_resolves; then
+            step 'Управление: sudo mtdd-ctl (меню)'
+        else
+            step "Управление: sudo $MTDD_CTL (меню)"
+        fi
     else
         step 'Управление: sudo bash '"$src_desc"' (то же меню, что и mtdd-ctl)'
     fi
@@ -1849,6 +2001,8 @@ EOF
 # ---------------------------------------------------------------------------
 # Диспетчер
 # ---------------------------------------------------------------------------
+# Тестовый хук: подключить функции без запуска (MTDD_INSTALLER_SOURCE_ONLY=1 source install.sh).
+if [[ ${MTDD_INSTALLER_SOURCE_ONLY:-} == 1 ]]; then return 0 2>/dev/null || exit 0; fi
 for cmd_dep in curl sha256sum awk mktemp install; do need "$cmd_dep"; done
 if [[ -n $command ]]; then
     case $command in
