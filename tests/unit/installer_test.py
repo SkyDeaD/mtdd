@@ -6,11 +6,14 @@ import http.server
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
+import unicodedata
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -502,6 +505,7 @@ class LauncherTest(unittest.TestCase):
         self.assertIn("for scoped in 1 0; do", body)
         self.assertIn("'api_read_token_env': 'MTDD_API_READ_TOKEN'", body)
         self.assertIn("'metrics_token_env': 'MTDD_METRICS_TOKEN'", body)
+        self.assertIn("'usage_state_path': '/var/lib/mtdd/usage.json'", body)
         self.assertLess(body.index("for scoped in 1 0; do"), body.index('mv -f -- "$config_candidate" "$MTDD_CONF"'))
 
     def update_snippet(self):
@@ -532,6 +536,458 @@ class LauncherTest(unittest.TestCase):
         subprocess.run(["python3", "-c", self.update_snippet(), str(creds)], check=True)
         self.assertEqual(creds.read_text(), "MTDD_API_TOKEN=x\nMTDD_API_READ_TOKEN=r\nMTDD_METRICS_TOKEN=m\n")
 
+
+
+def display_width(line):
+    """Ширина строки в колонках терминала без ANSI-последовательностей."""
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+    return sum(0 if unicodedata.combining(ch)
+               else 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in plain)
+
+
+class MetricsDashboardTest(unittest.TestCase):
+    """Дашборд метрик и metrics_fetch: без root, systemd и сети."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+        # Копия установщика, где пути конфигурации указывают во временный каталог.
+        self.conf = self.root / "config.json"
+        self.creds = self.root / "credentials.env"
+        self.script = self.root / "install-copy.sh"
+        self.script.write_text(INSTALLER.read_text()
+                               .replace("/etc/mtdd/config.json", str(self.conf))
+                               .replace("/etc/mtdd/credentials.env", str(self.creds)))
+        self.dashboard = self.root / "dashboard.py"
+        result = self.sh("metrics_python")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.dashboard.write_text(result.stdout)
+        self.status = self.root / "status.json"
+        self.history = self.root / "history.tsv"
+        self.prom = self.root / "metrics.txt"
+        self.write_fixture()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sh(self, body, **env):
+        full = os.environ.copy()
+        full.update(MTDD_INSTALLER_SOURCE_ONLY="1", **env)
+        return subprocess.run(
+            ["bash", "-c", f'set -Eeuo pipefail; source "{self.script}"; ' + body],
+            text=True, capture_output=True, env=full, timeout=60)
+
+    def dc(self, number, up=True):
+        return {"dc": str(number), "connected": up, "connections": 4,
+                "ready_connections": 4 if up else 0, "pool_target": 4, "bound_clients": 31,
+                "ping_rtt_us": 95000 if up else 0, "ready_queue_depth": 2,
+                "ready_queue_clients": 1, "frames_queued_bytes": 2048, "out_queued_bytes": 512,
+                "rx_bytes_total": 7_300_000_000, "tx_bytes_total": 2_100_000_000,
+                "creation_failures_total": 1}
+
+    def data(self, active_fields=True):
+        history = {"hour": {"estimate": 410, "started_at": 1_700_000_000},
+                   "day": {"estimate": 2210}, "week": {"estimate": 8120},
+                   "relative_standard_error": 0.0325}
+        data = {"ready": True, "revision": 17, "uptime_seconds": 273000,
+                "users_total": 12, "users_enabled": 11, "connections_active": 142,
+                "connections_accepted_total": 123456, "connections_rejected_total": 321,
+                "unique_ips_active": 131, "handshakes_total": 124000,
+                "replay_cache_entries": 5400,
+                "buffer_bytes": {"queued": 4096, "pending_write": 20480, "relay": 1500000},
+                "backpressure_events_total": {"c2s": 31, "s2c": 4},
+                "unique_ip_history": history, "build": {"version": "0.9.0"},
+                "me": {"connected_dcs": 2, "pending_buffer_bytes": 1024,
+                       "requests_total": 55000, "reconnects_total": 3,
+                       "dcs": [self.dc(1), self.dc(2), self.dc(4, up=False)]}}
+        if active_fields:
+            data["unique_ips_active"] = 118
+            data["unique_ips_seen"] = 131
+            history.update(hour_active={"estimate": 352}, day_active={"estimate": 1730},
+                           week_active={"estimate": 6400}, min_bytes=4096)
+        return data
+
+    def write_fixture(self, points=60, active_fields=True):
+        self.status.write_text(json.dumps({"data": self.data(active_fields)}))
+        self.prom.write_text('mtdd_handshakes_total{result="success"} 123000\n'
+                             'mtdd_connections_rejected_total{reason="limit"} 300\n'
+                             "mtdd_handshakes_pending 3\n")
+        now = time.time()
+        with self.history.open("w", encoding="utf-8") as handle:
+            for i in range(points):
+                handle.write("{:.0f}\t{}\t{}\t{}\t{:.1f}\t3\t{}\t{}\n".format(
+                    now - (points - i) * 25, 100 + i, 80 + i, i * 90_000_000,
+                    40 + i % 30, 300 + i // 5, 120000 + i * 20))
+
+    def render(self, columns, color=False):
+        env = os.environ.copy()
+        for name in ("NO_COLOR", "MTDD_LIVE"):
+            env.pop(name, None)
+        env.update(COLUMNS=str(columns), MTDD_JSON=str(self.status),
+                   MTDD_METRICS_TXT=str(self.prom), MTDD_HISTORY_FILE=str(self.history),
+                   MTDD_METRICS_INTERVAL="100000", MTDD_COLOR="1" if color else "0")
+        if color:
+            env.update(MTDD_C_RESET="\033[0m", MTDD_C_BOLD="\033[1m", MTDD_C_DIM="\033[2m",
+                       MTDD_C_GRAY="\033[38;5;245m", MTDD_C_ACCENT="\033[38;5;45m",
+                       MTDD_C_VIOLET="\033[38;5;141m", MTDD_C_GREEN="\033[38;5;114m",
+                       MTDD_C_YELLOW="\033[38;5;221m", MTDD_C_RED="\033[38;5;203m")
+        result = subprocess.run(["python3", str(self.dashboard)], text=True,
+                                capture_output=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_render_never_exceeds_terminal_width(self):
+        for columns in (60, 80, 120, 200):
+            for color in (False, True):
+                out = self.render(columns, color)
+                widest = max(display_width(line) for line in out.splitlines())
+                self.assertLess(widest, columns, f"{columns} cols, color={color}")
+
+    def test_cards_adapt_to_width(self):
+        wide = self.render(120)
+        narrow = self.render(60)
+        # Широкий терминал: все четыре карточки в одном ряду.
+        row = next(line for line in wide.splitlines() if "Соединения" in line and "╭" in line)
+        for title in ("Уникальные IP", "Трафик в секунду", "ME RTT"):
+            self.assertIn(title, row)
+        row = next(line for line in narrow.splitlines() if "Соединения" in line and "╭" in line)
+        self.assertNotIn("ME RTT", row)
+
+    def test_graphs_are_three_rows_and_separated(self):
+        lines = self.render(80).splitlines()
+        titles = [i for i, line in enumerate(lines) if "Активные соединения" in line and "сейчас" in line]
+        self.assertEqual(len(titles), 1)
+        top = titles[0]
+        self.assertIn("┤", lines[top + 1])
+        self.assertIn("│", lines[top + 2])
+        self.assertIn("┤", lines[top + 3])
+        self.assertEqual(lines[top + 4], "")
+        self.assertTrue(any(ch in lines[top + 1] + lines[top + 2] + lines[top + 3]
+                            for ch in "▁▂▃▄▅▆▇█"))
+
+    def test_no_color_uses_symbols_and_no_escape_codes(self):
+        out = self.render(80, color=False)
+        self.assertNotIn("\x1b", out)
+        for symbol in ("✓", "!", "✗"):
+            self.assertIn(symbol, out)
+
+    def test_color_mode_keeps_symbols(self):
+        out = self.render(80, color=True)
+        self.assertIn("\x1b[", out)
+        for symbol in ("✓", "!", "✗"):
+            self.assertIn(symbol, out)
+
+    def test_active_and_seen_ips_are_shown_with_hint(self):
+        out = self.render(80)
+        self.assertIn("118 / 131", out)
+        self.assertIn("≈352 / ≈410", out)
+        self.assertIn("акт. — IP, передавшие", out)
+        self.assertIn("4.0 KiB", out)
+
+    def test_old_status_without_active_fields_renders(self):
+        self.write_fixture(active_fields=False)
+        out = self.render(80)
+        self.assertIn("131 сейчас", out)
+        self.assertIn("≈410", out)
+        self.assertNotIn("акт. — IP", out)
+
+    def test_short_history_shows_collecting_message(self):
+        for points in (0, 1):
+            self.write_fixture(points=points)
+            out = self.render(80)
+            self.assertIn("собираю историю…", out)
+            self.assertNotIn("┤", out)
+
+    def test_old_history_rows_still_parse(self):
+        with self.history.open("a", encoding="utf-8") as handle:
+            handle.write("broken line\n1\t2\t3\n")
+        out = self.render(80)
+        self.assertIn("Динамика · 60 точек", out)
+
+    def serve(self, status=200):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(handler):
+                seen.append((handler.path, handler.headers.get("Authorization")))
+                body = (b"mtdd_uptime_seconds 5\n" if status == 200 else b"nope\n")
+                handler.send_response(status)
+                handler.send_header("Content-Length", str(len(body)))
+                handler.end_headers()
+                handler.wfile.write(body)
+
+            def log_message(handler, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        return server.server_port, seen
+
+    def free_port(self):
+        import socket
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def configure(self, **config):
+        self.conf.write_text(json.dumps(config))
+        self.creds.write_text("MTDD_API_TOKEN=" + "a" * 40 + "\nMTDD_METRICS_TOKEN=" + "m" * 40 + "\n")
+
+    def test_metrics_fetch_falls_back_to_api_port_without_metrics_port(self):
+        api_port, api_seen = self.serve()
+        self.configure(control_host="127.0.0.1", control_port=api_port)
+        result = self.sh("metrics_fetch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mtdd_uptime_seconds", result.stdout)
+        self.assertEqual(api_seen, [("/metrics", "Bearer " + "a" * 40)])
+
+    def test_metrics_fetch_falls_back_when_metrics_listener_is_down(self):
+        api_port, api_seen = self.serve()
+        self.configure(control_host="127.0.0.1", control_port=api_port,
+                       metrics_host="127.0.0.1", metrics_port=self.free_port())
+        result = self.sh("metrics_fetch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mtdd_uptime_seconds", result.stdout)
+        self.assertEqual(len(api_seen), 1)
+
+    def test_metrics_fetch_falls_back_when_metrics_listener_rejects(self):
+        api_port, api_seen = self.serve()
+        metrics_port, metrics_seen = self.serve(status=401)
+        self.configure(control_port=api_port, metrics_port=metrics_port)
+        result = self.sh("metrics_fetch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(metrics_seen), 1)
+        self.assertEqual(len(api_seen), 1)
+
+    def test_metrics_fetch_prefers_metrics_port_with_its_token(self):
+        api_port, api_seen = self.serve()
+        metrics_port, metrics_seen = self.serve()
+        self.configure(control_port=api_port, metrics_port=metrics_port,
+                       metrics_token_env="MTDD_METRICS_TOKEN")
+        result = self.sh("metrics_fetch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(metrics_seen, [("/metrics", "Bearer " + "m" * 40)])
+        self.assertEqual(api_seen, [])
+        self.assertNotIn("m" * 40, result.stdout + result.stderr)
+
+    def test_metrics_fetch_without_token_env_sends_no_authorization(self):
+        api_port, api_seen = self.serve()
+        metrics_port, metrics_seen = self.serve()
+        self.configure(control_port=api_port, metrics_port=metrics_port)
+        self.assertEqual(self.sh("metrics_fetch").returncode, 0)
+        self.assertEqual(metrics_seen, [("/metrics", None)])
+        self.assertEqual(api_seen, [])
+
+    def test_metrics_port_zero_means_legacy_endpoint(self):
+        api_port, api_seen = self.serve()
+        self.configure(control_port=api_port, metrics_port=0)
+        self.assertEqual(self.sh("metrics_fetch").returncode, 0)
+        self.assertEqual(len(api_seen), 1)
+
+
+class PolicyShellCase(unittest.TestCase):
+    """Общая основа: копия установщика с путями во временном каталоге, без root."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.conf = self.root / "config.json"
+        self.creds = self.root / "credentials.env"
+        self.script = self.root / "install-copy.sh"
+        self.script.write_text(INSTALLER.read_text()
+                               .replace("/etc/mtdd/config.json", str(self.conf))
+                               .replace("/etc/mtdd/credentials.env", str(self.creds)))
+
+    def sh(self, body, *args):
+        # Аргументы идут через окружение ($T1, $T2…): позиционные разбирал бы сам установщик.
+        env = os.environ.copy()
+        env["MTDD_INSTALLER_SOURCE_ONLY"] = "1"
+        env.update({f"T{i}": value for i, value in enumerate(args, 1)})
+        return subprocess.run(
+            ["bash", "-c", f'set -Eeuo pipefail; source "{self.script}"; ' + body],
+            text=True, capture_output=True, env=env, timeout=60)
+
+
+class UserPolicyTest(PolicyShellCase):
+    """Помощники политик пользователей в лаунчере: разбор ввода и JSON."""
+
+    def body(self, field, value):
+        return self.sh('policy_body "$T1" "$T2"', field, value)
+
+    def assertBody(self, field, value, expected):
+        result = self.body(field, value)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {field: expected})
+
+    def assertRejected(self, field, value, text=None):
+        result = self.body(field, value)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(result.stdout, "")
+        if text:
+            self.assertIn(text, result.stderr)
+
+    def test_quota_accepts_binary_human_sizes(self):
+        for raw, expected in (("10G", 10 * 1024 ** 3), ("500M", 500 * 1024 ** 2),
+                              ("1T", 1024 ** 4), ("2k", 2048), ("1.5G", 1610612736),
+                              ("10GiB", 10 * 1024 ** 3), ("12345", 12345), ("1", 1)):
+            with self.subTest(raw=raw):
+                self.assertBody("data_quota_bytes", raw, expected)
+
+    def test_quota_clear_and_rejects_garbage(self):
+        for raw in ("", "none", "NONE", "null", "-"):
+            self.assertBody("data_quota_bytes", raw, None)
+        for raw in ("0", "abc", "-5", "10X", "1e3", "0.0001K", "99999999999999999999T"):
+            with self.subTest(raw=raw):
+                self.assertRejected("data_quota_bytes", raw)
+
+    def test_rate_limits_reject_below_one_kib(self):
+        self.assertBody("rate_limit_up_bytes_per_sec", "2M", 2 * 1024 ** 2)
+        self.assertBody("rate_limit_down_bytes_per_sec", "1K", 1024)
+        self.assertBody("rate_limit_down_bytes_per_sec", "1024", 1024)
+        self.assertBody("rate_limit_up_bytes_per_sec", "none", None)
+        self.assertRejected("rate_limit_up_bytes_per_sec", "1023", "1K")
+        self.assertRejected("rate_limit_down_bytes_per_sec", "0.5K", "1K")
+
+    def test_unique_ip_limit_bounds(self):
+        self.assertBody("max_unique_ips", "3", 3)
+        self.assertBody("max_unique_ips", "4294967295", 4294967295)
+        self.assertBody("max_unique_ips", "", None)
+        for raw in ("0", "4294967296", "-1", "1.5", "x"):
+            with self.subTest(raw=raw):
+                self.assertRejected("max_unique_ips", raw)
+
+    def test_expiry_date_becomes_end_of_day_utc(self):
+        self.assertBody("expires_at", "2030-01-01", "2030-01-01T23:59:59Z")
+        self.assertBody("expires_at", "2028-02-29", "2028-02-29T23:59:59Z")
+        self.assertBody("expires_at", "2030-01-01T00:00:00Z", "2030-01-01T00:00:00Z")
+        self.assertBody("expires_at", "2030-01-01t10:00:00+03:00", "2030-01-01T10:00:00+03:00")
+        self.assertBody("expires_at", "none", None)
+        self.assertBody("expires_at", "", None)
+        for raw in ("2030-02-30", "2029-02-29", "2030-13-01", "01.01.2030", "2030-01-01T25:00:00Z",
+                    "2030-01-01T00:00:00", "tomorrow"):
+            with self.subTest(raw=raw):
+                self.assertRejected("expires_at", raw)
+
+    def test_note_is_json_escaped_and_validated(self):
+        tricky = 'say "hi" \\ {"enabled":false} \u00e9 \u0434\u0430'
+        self.assertBody("note", tricky, tricky)
+        self.assertBody("note", "", "")
+        self.assertBody("note", "a" * 256, "a" * 256)
+        self.assertRejected("note", "a" * 257, "256")
+        self.assertRejected("note", "tab\there", "управляющие")
+
+    def test_unknown_field_is_rejected(self):
+        self.assertRejected("enabled", "true", "Неизвестное поле")
+
+    def test_output_is_compact_json_with_single_key(self):
+        result = self.body("max_unique_ips", "5")
+        self.assertEqual(result.stdout.strip(), '{"max_unique_ips":5}')
+
+    def test_users_set_validates_before_any_request(self):
+        # Конфигурации нет: если бы запрос ушёл, ошибка была бы про токен, а не про размер.
+        result = self.sh('cmd_users_set bob data_quota_bytes oops')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Неверный размер", result.stderr)
+        self.assertNotIn("MTDD_API_TOKEN", result.stderr)
+        result = self.sh('cmd_users_set "bad name" note x')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Неверное имя", result.stderr)
+
+
+class UserPolicyApiTest(PolicyShellCase):
+    """Запросы лаунчера к фиктивному API: тела, пути, показ данных и ошибок."""
+
+    def start_api(self, responses):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def handle_any(handler):
+                length = int(handler.headers.get("Content-Length") or 0)
+                body = handler.rfile.read(length).decode() if length else ""
+                seen.append((handler.command, handler.path, body,
+                             handler.headers.get("Authorization")))
+                status, payload = responses.get((handler.command, handler.path.split("?")[0]),
+                                                (200, {"ok": True, "request_id": 1, "data": {}}))
+                raw = json.dumps(payload).encode()
+                handler.send_response(status)
+                handler.send_header("Content-Length", str(len(raw)))
+                handler.end_headers()
+                handler.wfile.write(raw)
+
+            do_GET = do_POST = do_PATCH = handle_any
+
+            def log_message(handler, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (server.shutdown(), server.server_close()))
+        self.conf.write_text(json.dumps({"control_host": "127.0.0.1",
+                                         "control_port": server.server_port}))
+        self.creds.write_text("MTDD_API_TOKEN=" + "a" * 40 + "\n")
+        return seen
+
+    def test_set_sends_patch_with_escaped_json(self):
+        seen = self.start_api({})
+        result = self.sh('cmd_users_set bob note "$T1"', 'x","enabled":false,"y":"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        method, path, body, auth = seen[0]
+        self.assertEqual((method, path, auth), ("PATCH", "/v1/users/bob", "Bearer " + "a" * 40))
+        self.assertEqual(json.loads(body), {"note": 'x","enabled":false,"y":"'})
+
+    def test_server_error_message_is_shown(self):
+        self.start_api({("POST", "/v1/users/bob/reset-quota"): (
+            500, {"ok": False, "request_id": 2,
+                  "error": {"type": "internal", "message": "not wired yet"}})})
+        result = self.sh("cmd_users_action bob reset-quota")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not wired yet", result.stderr)
+
+    def test_actions_post_empty_body(self):
+        seen = self.start_api({})
+        for action in ("enable", "disable", "reset-quota"):
+            self.assertEqual(self.sh(f"cmd_users_action bob {action}").returncode, 0)
+        self.assertEqual([(m, p, b) for m, p, b, _ in seen],
+                         [("POST", f"/v1/users/bob/{a}", "") for a in ("enable", "disable", "reset-quota")])
+
+    def test_show_renders_policy_in_human_form(self):
+        user = {"name": "bob", "enabled": True, "expires_at": "2030-01-01T23:59:59Z",
+                "data_quota_bytes": 10 * 1024 ** 3, "quota_used_bytes": 1024 ** 3,
+                "max_unique_ips": 3, "rate_limit_up_bytes_per_sec": 2 * 1024 ** 2,
+                "rate_limit_down_bytes_per_sec": None, "max_connections": None,
+                "note": "friend", "stats": {"active_connections": 2, "unique_ips_active": 1}}
+        self.start_api({("GET", "/v1/users/bob"): (200, {"ok": True, "request_id": 3,
+                                                       "data": {"user": user}})})
+        result = self.sh("NO_COLOR=1; cmd_users_show bob")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text in ("2030-01-01 23:59:59 UTC", "1.0 GiB / 10.0 GiB (10%)", "2.0 MiB/s",
+                     "friend", "без лимита"):
+            self.assertIn(text, result.stdout)
+
+    def test_show_without_quota_used_still_works(self):
+        user = {"name": "bob", "enabled": False, "data_quota_bytes": 5 * 1024 ** 2, "note": ""}
+        self.start_api({("GET", "/v1/users/bob"): (200, {"ok": True, "request_id": 3,
+                                                       "data": {"user": user}})})
+        result = self.sh("cmd_users_show bob")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("5.0 MiB", result.stdout)
+        self.assertIn("отключён", result.stdout)
+
+    def test_audit_lists_events_with_limit(self):
+        events = [{"id": 1, "at": "2030-01-01T10:00:00Z", "action": "user.update",
+                   "user": "bob", "source": "127.0.0.1", "revision": 7, "request_id": 9,
+                   "applied": True, "fields": ["enabled", "note"]}]
+        seen = self.start_api({("GET", "/v1/events"): (200, {"ok": True, "request_id": 4,
+                                                           "data": {"events": events}})})
+        result = self.sh("cmd_audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(seen[0][1], "/v1/events?limit=20")
+        for text in ("2030-01-01 10:00:00", "user.update", "bob", "enabled, note"):
+            self.assertIn(text, result.stdout)
+        self.assertNotEqual(self.sh("cmd_audit abc").returncode, 0)
 
 
 if __name__ == "__main__":
