@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
@@ -90,6 +91,10 @@ int serve(const mtdd::Config& config) {
     http.public_host = config.public_host;
     http.public_port = config.public_port;
     http.tls_domain = config.tls_domain;
+    http.config_json = config.public_view().dump();
+    http.system_info_json =
+        nlohmann::json{{"workers_configured", config.workers},
+                       {"security", config.security_posture()}}.dump();
     mtdd::control::ControlServer management{users, stats, std::move(http)};
     const auto listening = management.start();
     if (!listening) throw std::runtime_error("cannot start management listener");

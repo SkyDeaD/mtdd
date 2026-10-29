@@ -150,9 +150,33 @@ def run(binary, parse_metrics=False):
                     identities = {(sample.name, tuple(sorted(sample.labels.items()))) for sample in samples}
                     assert len(identities) == len(samples), "duplicate Prometheus sample"
                     print(f"HTTP Prometheus parser: {len(families)} families, {len(samples)} unique samples")
+                # v2 surface against the real binary: envelope, views, stats, actions, audit.
+                status, headers, payload = request("/v1/system/info", bearer=read_token)
+                info = json.loads(payload)
+                assert status == 200 and info["ok"] is True
+                assert headers.get("X-Request-Id") == str(info["request_id"])
+                assert info["data"]["security"]["api"]["read_token"] is True
+                status, _, payload = request("/v1/config", bearer=read_token)
+                assert status == 200
+                for credential in (token, read_token, metrics_token):
+                    assert credential.encode() not in payload, "config view leaked a credential"
+                status, _, payload = request("/v1/stats/summary", bearer=read_token)
+                assert status == 200 and "seen" in json.loads(payload)["data"]["unique_ips"]["day"]
+                assert request("/v1/stats/users?sort=traffic&limit=5", bearer=read_token)[0] == 200
+                assert request("/v1/stats/users?bogus=1", bearer=read_token)[0] == 400
+                assert request("/v1/users/alice", "PATCH", {"note": "smoke", "max_unique_ips": 2})[0] == 200
+                status, _, payload = request("/v1/users/alice/disable", "POST")
+                assert status == 200 and json.loads(payload)["data"]["user"]["enabled"] is False
+                assert request("/v1/users/alice/enable", "POST", bearer=read_token)[0] == 403
+                assert request("/v1/users/alice/enable", "POST")[0] == 200
+                status, _, payload = request("/v1/events", bearer=read_token)
+                assert status == 200
+                actions = [event["action"] for event in json.loads(payload)["data"]["events"]]
+                assert actions[-3:] == ["user.update", "user.disable", "user.enable"], actions
+                assert secret.encode() not in payload
                 assert request("/v1/users/alice", "DELETE")[0] == 200
                 assert request("/v1/users/alice")[0] == 404
-                print("control smoke: passed; token scopes, metrics listener, authentication, CRUD, ETag, redaction, metrics, ME readiness")
+                print("control smoke: passed; token scopes, metrics listener, authentication, CRUD, ETag, redaction, metrics, ME readiness, v2 views/stats/actions/audit")
             finally:
                 child.send_signal(signal.SIGTERM) if child.poll() is None else None
                 try:

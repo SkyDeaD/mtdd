@@ -136,10 +136,10 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
         "api_token_env", "tls_domain", "ad_tag", "users_path", "me_config_path", "me_secret_path",
         "workers", "max_connections", "max_handshakes", "max_frame_bytes", "connection_queue_bytes",
         "global_buffer_bytes", "handshake_timeout_seconds", "idle_timeout_seconds", "shutdown_timeout_seconds",
-        "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path",
+        "metadata_refresh_seconds", "fallback_host", "fallback_port", "masking", "unique_ip_stats_path", "usage_state_path",
         "direct_fallback_enabled", "direct_fallback_dcs", "me_connections_per_dc",
         "me_clients_per_writer", "api_read_token_env", "control_allow", "metrics_host", "metrics_port",
-        "metrics_token_env", "metrics_allow"};
+        "metrics_token_env", "metrics_allow", "unique_ip_min_bytes"};
     for (const auto& [key, ignored] : value.items()) {
         (void)ignored;
         if (!allowed.contains(key)) throw std::invalid_argument("unknown configuration option: " + key);
@@ -215,12 +215,21 @@ Config Config::parse(const nlohmann::json& value, const std::filesystem::path& b
     if (value.contains("me_secret_path")) config.me_secret_path = resolve(base, text(value, "me_secret_path", ""));
     if (config.me_config_path.empty() != config.me_secret_path.empty())
         throw std::invalid_argument("me_config_path and me_secret_path must be provided together");
+    config.unique_ip_min_bytes = number(value, "unique_ip_min_bytes", config.unique_ip_min_bytes, 0, 1ULL << 40);
     if (value.contains("unique_ip_stats_path")) {
         config.unique_ip_stats_path = resolve(base, text(value, "unique_ip_stats_path", ""));
         if (config.unique_ip_stats_path == config.users_path ||
             config.unique_ip_stats_path == config.me_config_path ||
             config.unique_ip_stats_path == config.me_secret_path)
             throw std::invalid_argument("unique IP statistics must use a separate file");
+    }
+    if (value.contains("usage_state_path")) {
+        config.usage_state_path = resolve(base, text(value, "usage_state_path", ""));
+        if (config.usage_state_path == config.users_path ||
+            config.usage_state_path == config.me_config_path ||
+            config.usage_state_path == config.me_secret_path ||
+            (!config.usage_state_path.empty() && config.usage_state_path == config.unique_ip_stats_path))
+            throw std::invalid_argument("usage state must use a separate file");
     }
     config.workers = static_cast<std::uint32_t>(number(value, "workers", 0, 0, 256));
     config.me_connections_per_dc = static_cast<std::uint32_t>(
@@ -292,4 +301,67 @@ Config Config::load(const std::filesystem::path& path) {
         throw std::invalid_argument("invalid JSON configuration");
     }
 }
+nlohmann::json Config::public_view() const {
+    nlohmann::json dcs = nlohmann::json::array();
+    for (const auto dc : direct_fallback_dcs) dcs.push_back(dc);
+    return {
+        {"proxy_host", proxy_host},
+        {"proxy_port", proxy_port},
+        {"public_host", public_host},
+        {"public_port", public_port},
+        {"control_host", control_host},
+        {"control_port", control_port},
+        {"allow_remote_control", allow_remote_control},
+        {"control_allow", control_allow},
+        {"metrics_host", metrics_host},
+        {"metrics_port", metrics_port},
+        {"metrics_allow", metrics_allow},
+        {"api_token_env", api_token_env},
+        {"api_read_token_env", api_read_token_env},
+        {"metrics_token_env", metrics_token_env},
+        {"fallback_host", fallback_host},
+        {"fallback_port", fallback_port},
+        {"masking", masking},
+        {"tls_domain", tls_domain},
+        {"ad_tag_set", std::any_of(ad_tag.begin(), ad_tag.end(), [](auto b) { return b != 0; })},
+        {"users_path", users_path.string()},
+        {"unique_ip_stats_path", unique_ip_stats_path.string()},
+        {"usage_state_path", usage_state_path.string()},
+        {"unique_ip_min_bytes", unique_ip_min_bytes},
+        {"me_config_path", me_config_path.string()},
+        {"me_secret_path", me_secret_path.string()},
+        {"workers", workers},
+        {"max_connections", max_connections},
+        {"me_connections_per_dc", me_connections_per_dc},
+        {"me_clients_per_writer", me_clients_per_writer},
+        {"max_handshakes", max_handshakes},
+        {"max_frame_bytes", max_frame_bytes},
+        {"connection_queue_bytes", connection_queue_bytes},
+        {"global_buffer_bytes", global_buffer_bytes},
+        {"handshake_timeout_seconds", handshake_timeout.count()},
+        {"idle_timeout_seconds", idle_timeout.count()},
+        {"shutdown_timeout_seconds", shutdown_timeout.count()},
+        {"metadata_refresh_seconds", metadata_refresh.count()},
+        {"direct_fallback_enabled", direct_fallback_enabled},
+        {"direct_fallback_dcs", std::move(dcs)}};
+}
+
+nlohmann::json Config::security_posture() const {
+    const bool metrics_on = metrics_port != 0;
+    return {
+        {"api", {{"host", control_host},
+                 {"loopback_only", loopback(control_host)},
+                 {"read_token", !api_read_token_env.empty()},
+                 {"allowlist_entries", control_allow.size()}}},
+        {"metrics", {{"enabled", metrics_on},
+                     {"host", metrics_on ? nlohmann::json(metrics_host) : nlohmann::json(nullptr)},
+                     {"loopback_only", metrics_on && loopback(metrics_host)},
+                     {"token", metrics_on && !metrics_token_env.empty()},
+                     {"allowlist_entries", metrics_allow.size()}}},
+        {"masking", masking},
+        {"tls_domain_set", !tls_domain.empty()},
+        {"global_connection_cap", max_connections != 0},
+        {"handshake_cap", max_handshakes != 0}};
+}
+
 } // namespace mtdd

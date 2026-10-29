@@ -283,6 +283,21 @@ TEST(Config, UniqueIpHistoryPathIsOptionalResolvedAndSeparateFromUsers) {
     EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
 }
 
+TEST(Config, UniqueIpMinBytesDefaultsToOneMiBAndIsRangeChecked) {
+    EXPECT_EQ(mtdd::Config::parse(minimal_config(), "/work").unique_ip_min_bytes, 1048576U);
+    auto value = minimal_config();
+    value["unique_ip_min_bytes"] = 0;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").unique_ip_min_bytes, 0U);
+    value["unique_ip_min_bytes"] = 1ULL << 40;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").unique_ip_min_bytes, 1ULL << 40);
+    value["unique_ip_min_bytes"] = (1ULL << 40) + 1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["unique_ip_min_bytes"] = -1;
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+    value["unique_ip_min_bytes"] = "100";
+    EXPECT_THROW(mtdd::Config::parse(value, "/work"), std::invalid_argument);
+}
+
 TEST(Metadata, ParsesSignedDcRoutesAndDeduplicates) {
     const auto endpoints = mtdd::parse_me_config(
         "# comment\ndefault 2;\nproxy_for 2 149.154.167.91:8888;\n"
@@ -383,4 +398,20 @@ TEST(Config, DirectFallbackIsOptInAndOnlyAcceptsSignedDcOneToFive) {
     auto not_array = value;
     not_array["direct_fallback_dcs"] = 2;
     EXPECT_THROW(mtdd::Config::parse(not_array, "/work"), std::invalid_argument);
+}
+
+TEST(Config, PublicViewOmitsAdTagAndReportsPosture) {
+    mtdd::Config config;
+    config.ad_tag[0] = 0xab;
+    config.api_token_env = "MTDD_API_TOKEN";
+    const auto view = config.public_view();
+    EXPECT_EQ(view["ad_tag_set"], true);
+    EXPECT_FALSE(view.contains("ad_tag"));
+    EXPECT_EQ(view["api_token_env"], "MTDD_API_TOKEN");
+    const auto posture = config.security_posture();
+    EXPECT_EQ(posture["api"]["loopback_only"], true);
+    EXPECT_EQ(posture["metrics"]["enabled"], true);
+    EXPECT_EQ(posture["metrics"]["token"], false);
+    config.metrics_port = 0;
+    EXPECT_TRUE(config.security_posture()["metrics"]["host"].is_null());
 }

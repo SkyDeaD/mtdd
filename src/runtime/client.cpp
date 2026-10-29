@@ -302,6 +302,7 @@ void Runtime::Impl::handle_client(Client& client, std::uint32_t events, Time now
 
 void Runtime::Impl::read_client(Client& client, Time now) {
     if (client.draining || client.budget_paused || client.read_eof || client.close_requested) return;
+    if (client.rate_pause_c2s) return;  // resumed by process_rate_resumes()
     if (!budget_allows(8U * 1024U + detail::kBudgetHeadroom / 2)) {
         client.budget_paused = true;
         paused_clients_.push_back(client.token);
@@ -345,6 +346,7 @@ void Runtime::Impl::read_client(Client& client, Time now) {
                                  now);
             if (clients_.find(token) == clients_.end()) return;
             if (client.phase == Client::Phase::fallback) return;
+            if (client.rate_pause_c2s) break;
         } else if (received == 0) {
             latch_read_eof(client, now);
             return;
@@ -463,13 +465,26 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
                      control::HandshakeResult::failure);
         return;
     }
+    // Policy gates run after auth and replay, before any slot is reserved, so a
+    // rejected user never holds a connection slot.
+    if (user->policy.expires_at && *user->policy.expires_at <= unix_now()) {
+        reject_close(client, control::RejectReason::user_expired,
+                     control::HandshakeResult::failure);
+        return;
+    }
+    if (user->policy.data_quota_bytes &&
+        client.metrics->quota_used_bytes() >= *user->policy.data_quota_bytes) {
+        reject_close(client, control::RejectReason::user_quota_exceeded,
+                     control::HandshakeResult::failure);
+        return;
+    }
     // Reserve the per-user connection slot atomically: checking the count and
     // then opening would let two reactors both pass at the limit. On any later
     // failure close_client() rolls the reservation back because
     // metrics_counted is already true.
     if (user->max_connections) {
         if (!client.metrics->try_connection_open(*user->max_connections)) {
-            reject_close(client, control::RejectReason::overload,
+            reject_close(client, control::RejectReason::user_connection_limit,
                          control::HandshakeResult::failure);
             return;
         }
@@ -477,6 +492,7 @@ void Runtime::Impl::process_client_hello(Client& client, Time now) {
         client.metrics->connection_opened();
     }
     client.metrics_counted = true;
+    load_client_rates(client, *user);
     begin_client_tls(client, *user, std::move(info), record, now);
     if (clients_.find(token) != clients_.end()) reaccount(client);
 }
@@ -513,7 +529,6 @@ bool Runtime::Impl::authenticate_hello(Client& client, std::span<const std::uint
 void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& user,
                                      protocol::ClientHelloInfo&& info,
                                      std::span<const std::uint8_t> record, Time now) {
-    (void)user;
     protocol::FakeTlsConnection::Config tls_config;
     tls_config.secret = info.secret;
     tls_config.random = random_;
@@ -538,13 +553,17 @@ void Runtime::Impl::begin_client_tls(Client& client, const control::UserRecord& 
                      control::HandshakeResult::failure);
         return;
     }
-    if (!count_client_unique_ip(client)) {
-        reject_close(client, control::RejectReason::overload,
+    const auto ip_result = count_client_unique_ip(client, user.policy.max_unique_ips);
+    if (ip_result != IpCountResult::ok) {
+        reject_close(client,
+                     ip_result == IpCountResult::limit ? control::RejectReason::user_ip_limit
+                                                       : control::RejectReason::overload,
                      control::HandshakeResult::failure);
         return;
     }
     refresh_ip_history();
     stats_.observe_ip_history(client.ip_key);
+    note_ip_payload(client, 0);  // unique_ip_min_bytes == 0: active at handshake
     client.phase = Client::Phase::tls_handshake;
     client.deadline_kind = Client::DeadlineKind::handshake;
     deadlines_.set(client.token, now + config_.handshake_timeout);
@@ -607,6 +626,11 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
         if (client.metrics) {
             client.metrics->add_payload(control::Direction::client_to_server,
                                         plain_buffer_.size());
+            note_ip_payload(client, plain_buffer_.size());
+            if (client.rate_up != 0) {
+                charge_rate(client, control::Direction::client_to_server,
+                            plain_buffer_.size(), now);
+            }
         }
         client.awaiting_reply = true;
         client.last_forward_at = now;
@@ -638,6 +662,11 @@ void Runtime::Impl::feed_client_tls(Client& client, std::span<const std::uint8_t
             }
             client.metrics->add_payload(control::Direction::client_to_server,
                                         message.data.size());
+            note_ip_payload(client, message.data.size());
+            if (client.rate_up != 0) {
+                charge_rate(client, control::Direction::client_to_server,
+                            message.data.size(), now);
+            }
             client.c2s_capacity += bytes;
             client.c2s.push_back(std::move(message));
         }
