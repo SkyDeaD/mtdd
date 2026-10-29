@@ -536,7 +536,12 @@ class Statistics {
 // HTTP control server
 // ---------------------------------------------------------------------------
 
+// A listener either serves the management API (/v1/*, plus the deprecated
+// /metrics alias for the admin token) or only the Prometheus exporter.
+enum class HttpRole { api, metrics };
+
 struct HttpOptions {
+  HttpRole role{HttpRole::api};
   std::string public_host;
   uint16_t public_port{0};
   std::string tls_domain;
@@ -544,7 +549,16 @@ struct HttpOptions {
   uint16_t port{0};  // 0 => ephemeral, actual port from start()
   // Required; never persisted or logged by this module. Supplied by the leader
   // from the environment.
+  // api role: admin token, required. Ignored by the metrics role.
   std::string bearer_token;
+  // api role, optional: GET-only token; never sees /links or /metrics.
+  std::string read_token;
+  // metrics role, optional: when empty the listener relies on allow_networks
+  // alone, which then must not be empty.
+  std::string metrics_token;
+  // CIDR allowlist of peer addresses ("127.0.0.0/8", "::1"). Empty => any
+  // peer that holds a valid token. Refused peers get 403 before auth.
+  std::vector<std::string> allow_networks;
   size_t max_body_bytes{64 * 1024};
   size_t max_header_bytes{16 * 1024};
   // Max retained HTTP connections (1..4096). Each accepted connection gets an

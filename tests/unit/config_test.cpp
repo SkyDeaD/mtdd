@@ -27,6 +27,61 @@ TEST(Config, MinimalConfigHasUnlimitedConnectionDefaults) {
     EXPECT_EQ(config.ad_tag.back(), 0xff);
 }
 
+TEST(Config, MetricsListenerDefaultsToLoopbackWithoutToken) {
+    const auto config = mtdd::Config::parse(minimal_config(), "/work");
+    EXPECT_EQ(config.metrics_host, "127.0.0.1");
+    EXPECT_EQ(config.metrics_port, 9091);
+    EXPECT_TRUE(config.metrics_token_env.empty());
+    EXPECT_TRUE(config.api_read_token_env.empty());
+    EXPECT_EQ(config.metrics_allow, (std::vector<std::string>{"127.0.0.0/8", "::1"}));
+    EXPECT_TRUE(config.control_allow.empty());
+}
+
+TEST(Config, MetricsAndTokenOptionsAreValidated) {
+    auto value = minimal_config();
+    value["api_read_token_env"] = "MTDD_API_READ_TOKEN";
+    value["metrics_token_env"] = "MTDD_METRICS_TOKEN";
+    value["metrics_host"] = "0.0.0.0";
+    value["metrics_allow"] = {"10.0.0.0/8", "2001:db8::/32", "192.0.2.1"};
+    value["control_allow"] = {"127.0.0.1/32"};
+    const auto config = mtdd::Config::parse(value, "/work");
+    EXPECT_EQ(config.api_read_token_env, "MTDD_API_READ_TOKEN");
+    EXPECT_EQ(config.metrics_allow.size(), 3U);
+    EXPECT_EQ(config.control_allow.front(), "127.0.0.1/32");
+
+    value = minimal_config();
+    value["metrics_port"] = 0;
+    EXPECT_EQ(mtdd::Config::parse(value, "/work").metrics_port, 0);
+
+    const auto rejects = [](nlohmann::json bad) {
+        EXPECT_THROW(mtdd::Config::parse(bad, "/work"), std::invalid_argument) << bad.dump();
+    };
+    auto bad = minimal_config();
+    bad["metrics_allow"] = {"10.0.0.0/33"};
+    rejects(bad);
+    bad["metrics_allow"] = "127.0.0.1";
+    rejects(bad);
+    bad = minimal_config();
+    bad["metrics_allow"] = nlohmann::json::array();
+    rejects(bad);  // neither token nor allowlist
+    bad = minimal_config();
+    bad["metrics_host"] = "0.0.0.0";
+    rejects(bad);  // public exporter must opt in explicitly
+    bad = minimal_config();
+    bad["metrics_port"] = 9090;
+    rejects(bad);  // collides with control_port
+    bad = minimal_config();
+    bad["metrics_token_env"] = "MTDD_API_TOKEN";
+    rejects(bad);
+    bad = minimal_config();
+    bad["api_read_token_env"] = "X";
+    bad["metrics_token_env"] = "X";
+    rejects(bad);
+    bad = minimal_config();
+    bad["api_read_token_env"] = "BAD-NAME";
+    rejects(bad);
+}
+
 TEST(Config, PublicLinkAddressIsValidatedAndPortDefaultsToListener) {
     auto value = minimal_config();
     value["proxy_port"] = 1234;

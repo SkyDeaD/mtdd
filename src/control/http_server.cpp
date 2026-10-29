@@ -97,6 +97,7 @@ struct ControlServer::Impl {
   std::unique_ptr<detail::ConnectionGate> gate;
   detail::TokenBucket global_bucket;
   detail::SourceRateLimiter source_limits;
+  std::vector<detail::IpNetwork> allow;
 
   struct ApiRecord {
     Impl* self;
@@ -123,7 +124,10 @@ struct ControlServer::Impl {
     return bufferevent_socket_new(base_ref, -1, BEV_OPT_CLOSE_ON_FREE);
   }
 
-  bool authorized(evhttp_request* request) const {
+  enum class Scope { none, admin, read, metrics };
+
+  static bool bearer_matches(evhttp_request* request, std::string_view token) {
+    if (token.empty()) return false;
     const char* header = evhttp_find_header(
         evhttp_request_get_input_headers(request), "Authorization");
     if (header == nullptr) return false;
@@ -131,7 +135,25 @@ struct ControlServer::Impl {
     if (value.size() <= 7) return false;
     if (!ascii_iequals(value.substr(0, 6), "bearer")) return false;
     if (value[6] != ' ') return false;
-    return constant_time_equal(value.substr(7), options.bearer_token);
+    return constant_time_equal(value.substr(7), token);
+  }
+
+  Scope authorize(evhttp_request* request) const {
+    if (options.role == HttpRole::metrics) {
+      if (options.metrics_token.empty()) return Scope::metrics;
+      return bearer_matches(request, options.metrics_token) ? Scope::metrics
+                                                            : Scope::none;
+    }
+    if (bearer_matches(request, options.bearer_token)) return Scope::admin;
+    if (bearer_matches(request, options.read_token)) return Scope::read;
+    return Scope::none;
+  }
+
+  // Read tokens observe; anything that mutates or reveals a secret (links)
+  // or the legacy exporter alias stays admin-only.
+  static bool read_scope_allows(ApiRoute route, ApiMethod method) {
+    return method == ApiMethod::get && route != ApiRoute::user_links &&
+           route != ApiRoute::metrics;
   }
 
   void send_mutation(evhttp_request* request, const MutationOutcome& outcome,
@@ -182,7 +204,15 @@ struct ControlServer::Impl {
       return;
     }
 
-    if (!authorized(request)) {
+    if (!source_allowed(allow, request)) {
+      status = 403;
+      send_error(request, 403, "forbidden",
+                 "source address is not in the allowlist");
+      return;
+    }
+
+    const Scope scope = authorize(request);
+    if (scope == Scope::none) {
       status = 401;
       evhttp_add_header(evhttp_request_get_output_headers(request),
                         "WWW-Authenticate", "Bearer realm=\"mtdd\"");
@@ -198,7 +228,8 @@ struct ControlServer::Impl {
       return;
     }
 
-    if (route.route == ApiRoute::unknown) {
+    if (route.route == ApiRoute::unknown ||
+        (scope == Scope::metrics && route.route != ApiRoute::metrics)) {
       status = 404;
       send_error(request, 404, "not_found", "route not found");
       return;
@@ -208,6 +239,18 @@ struct ControlServer::Impl {
       send_error(request, 405, "method_not_allowed",
                  "method not allowed for this route");
       return;
+    }
+
+    if (scope == Scope::read && !read_scope_allows(route.route, method)) {
+      status = 403;
+      send_error(request, 403, "forbidden_scope",
+                 "read-only token cannot use this route or method");
+      return;
+    }
+    if (route.route == ApiRoute::metrics && scope == Scope::admin) {
+      // Served on the API port for one more release; scrape metrics_port.
+      evhttp_add_header(evhttp_request_get_output_headers(request),
+                        "Deprecation", "true");
     }
 
     switch (route.route) {
@@ -625,19 +668,60 @@ struct ControlServer::Impl {
     status = outcome.value().pending ? 202 : 200;
   }
 
-  Result<uint16_t> start() {
-    if (running.load(std::memory_order_acquire)) {
-      return Error{ErrorCode::invalid_config, "server is already running"};
+  static std::optional<Error> validate_token(std::string_view name,
+                                            std::string_view token) {
+    if (token.size() > 512) {
+      return Error{ErrorCode::invalid_config, std::string(name) + " is too long"};
+    }
+    for (char c : token) {
+      if (std::isspace(static_cast<unsigned char>(c)) || c == '\0') {
+        return Error{ErrorCode::invalid_config,
+                     std::string(name) + " must not contain whitespace or NUL"};
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<Error> validate_tokens() const {
+    if (options.role == HttpRole::metrics) {
+      return validate_token("metrics_token", options.metrics_token);
     }
     if (options.bearer_token.empty()) {
       return Error{ErrorCode::invalid_config,
                    "bearer_token is required; never run unauthenticated"};
     }
-    for (char c : options.bearer_token) {
-      if (std::isspace(static_cast<unsigned char>(c)) || c == '\0') {
+    if (auto invalid = validate_token("bearer_token", options.bearer_token)) {
+      return invalid;
+    }
+    if (auto invalid = validate_token("read_token", options.read_token)) {
+      return invalid;
+    }
+    if (!options.read_token.empty() &&
+        constant_time_equal(options.read_token, options.bearer_token)) {
+      return Error{ErrorCode::invalid_config,
+                   "read_token must differ from bearer_token"};
+    }
+    return std::nullopt;
+  }
+
+  Result<uint16_t> start() {
+    if (running.load(std::memory_order_acquire)) {
+      return Error{ErrorCode::invalid_config, "server is already running"};
+    }
+    if (auto invalid = validate_tokens()) return *invalid;
+    allow.clear();
+    for (const auto& entry : options.allow_networks) {
+      auto network = parse_ip_network(entry);
+      if (!network) {
         return Error{ErrorCode::invalid_config,
-                     "bearer_token must not contain whitespace or NUL"};
+                     "invalid allow_networks entry: " + entry};
       }
+      allow.push_back(*network);
+    }
+    if (options.role == HttpRole::metrics && options.metrics_token.empty() &&
+        allow.empty()) {
+      return Error{ErrorCode::invalid_config,
+                   "metrics listener needs metrics_token or allow_networks"};
     }
     if (options.bind_address.empty() || options.bind_address.size() > 128) {
       return Error{ErrorCode::invalid_config, "invalid bind_address"};

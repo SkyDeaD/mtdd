@@ -3,6 +3,7 @@
 
 #include <mtdd/control.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <initializer_list>
@@ -80,6 +81,18 @@ class SourceRateLimiter {
 // Stable hash of the source address only (never the port), used as the bounded
 // limiter key. Falls back to the textual peer if no sockaddr is available.
 uint64_t peer_key(evhttp_request* request);
+
+// IPv4-mapped IPv6 network; IPv4 prefixes are stored offset by 96 bits.
+struct IpNetwork {
+  std::array<uint8_t, 16> address{};
+  uint8_t prefix{128};
+};
+
+// "a.b.c.d[/n]" or "x::y[/n]"; a bare address is a single host.
+std::optional<IpNetwork> parse_ip_network(std::string_view text);
+// Empty allowlist admits everyone; unknown peer families are refused.
+bool source_allowed(const std::vector<IpNetwork>& allow,
+                    evhttp_request* request);
 
 std::string trim_copy(std::string_view value);
 bool ascii_iequals(std::string_view a, std::string_view b);

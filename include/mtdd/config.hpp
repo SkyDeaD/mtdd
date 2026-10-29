@@ -23,6 +23,17 @@ struct Config {
     // real server of the probed SNI name when it belongs to tls_domain.
     bool masking{true};
     std::string api_token_env{"MTDD_API_TOKEN"};
+    // Optional GET-only API token; empty means no read token is accepted.
+    std::string api_read_token_env;
+    // Peer allowlist for the API listener; empty admits any peer with a token.
+    std::vector<std::string> control_allow;
+    // Separate Prometheus listener. Port 0 disables it. 9091 rather than 9100
+    // so it does not collide with node_exporter on the same host.
+    std::string metrics_host{"127.0.0.1"};
+    std::uint16_t metrics_port{9091};
+    // Optional scrape token; without it only metrics_allow guards /metrics.
+    std::string metrics_token_env;
+    std::vector<std::string> metrics_allow{"127.0.0.0/8", "::1"};
     std::string tls_domain;
     std::array<std::uint8_t, 16> ad_tag{};
     std::filesystem::path users_path;
